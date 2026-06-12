@@ -15,6 +15,17 @@ rebar3 device package
 rebar3 device verify
 ```
 
+## published package
+
+```device publish: security@1.0 
+
+spec=25VbI-y2jJsd0fP1kOwCYWBAyDzC5eRpIGS86QVVlOw 
+
+impl=hmwPxMsP3Nn3btafwAeWb25DP9B-UrFOMPp-kSdhXO4
+
+signer=vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
+```
+
 ## Test
 
 ```sh
