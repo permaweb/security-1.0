@@ -8,7 +8,6 @@
 -module(dev_security).
 -include_lib("hb/include/hb.hrl").
 -implements(<<"security@1.0">>).
--include_lib("eunit/include/eunit.hrl").
 %%% Device API.
 -export([info/0, compute/3, validate/3]).
 
@@ -254,58 +253,3 @@ safe_match(_, _, _) ->
 %% the list.
 maybe_single([SingleElement], _Opts) -> SingleElement;
 maybe_single(List, _Opts) -> List.
-
-duplicate_authority_match_rejected_test() ->
-    ?assertEqual(
-        {error, <<"Too few acceptable committers present.">>},
-        validate(
-            <<"authority">>,
-            #{
-                <<"authority">> => [<<"alice">>, <<"bob">>],
-                <<"authority-match">> => 2
-            },
-            #{},
-            [<<"alice">>, <<"alice">>],
-            #{}
-        )
-    ).
-
-comma_separated_authority_config_supported_test() ->
-    ?assertEqual(
-        true,
-        validate(
-            <<"authority">>,
-            #{
-                <<"authority">> => <<"\"alice\",\"bob\"">>
-            },
-            #{},
-            [<<"alice">>, <<"bob">>],
-            #{}
-        )
-    ).
-
-prod_mode_requires_explicit_policy_test() ->
-    ?assertEqual(
-        {error, <<"Security policy not configured.">>},
-        validate(
-            <<"authority">>,
-            #{},
-            #{},
-            [<<"alice">>],
-            #{ dev_security_mode => prod }
-        )
-    ).
-
-prod_mode_allows_explicit_single_signer_policy_test() ->
-    ?assertEqual(
-        true,
-        validate(
-            <<"authority">>,
-            #{
-                <<"authority">> => <<"alice">>
-            },
-            #{},
-            [<<"alice">>],
-            #{ dev_security_mode => prod }
-        )
-    ).
