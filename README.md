@@ -17,11 +17,12 @@ rebar3 device verify
 
 ## published package
 
-```device publish: security@1.0 
+```bash
+device publish: security@1.0 
 
-spec=25VbI-y2jJsd0fP1kOwCYWBAyDzC5eRpIGS86QVVlOw 
+spec=_ON5QzOiLCP9rjWfW3ZWrx36ACBRACmr0TyPh5zkddE 
 
-impl=hmwPxMsP3Nn3btafwAeWb25DP9B-UrFOMPp-kSdhXO4
+impl=FQJuXZWRUbbGzEwtHvZfyQhTNRCkmdeFSzomSNyphXs 
 
 signer=vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
 ```
