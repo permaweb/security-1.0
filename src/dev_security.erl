@@ -10,12 +10,12 @@
 -implements(<<"security@1.0">>).
 -include_lib("eunit/include/eunit.hrl").
 %%% Device API.
--export([info/0, compute/3]).
+-export([info/0, compute/3, validate/3]).
 
 %% @doc Return the public security device API.
 info() ->
     #{
-        exports => [<<"compute">>]
+        exports => [<<"compute">>, <<"validate">>]
     }.
 
 %% @doc Compute the security-normalized request.
@@ -35,6 +35,29 @@ compute(Base, Req, Opts) ->
                 Opts
             ),
             {skip, Reason}
+    end.
+
+%% @doc Validate a caller-controlled security intent through the device API.
+%% Expected request keys:
+%% - `key`: the base security policy prefix to validate, such as
+%%   `set-authority`.
+%% - `from`: optional identity or identities to validate. If omitted, the
+%%   subject message signers are used.
+%% - `subject`: optional message used for signer extraction and event context.
+validate(Base, Req, Opts) ->
+    maybe
+        Key = hb_ao:get(<<"key">>, Req, not_found, Opts),
+        true ?= (Key =/= not_found) orelse {error, <<"Security key not found.">>},
+        SubjectMsg = hb_ao:get(<<"subject">>, Req, Req, Opts),
+        Res =
+            case hb_ao:get(<<"from">>, Req, not_found, Opts) of
+                not_found -> validate(Key, Base, SubjectMsg, Opts);
+                From -> validate(Key, Base, SubjectMsg, From, Opts)
+            end,
+        true ?= Res,
+        {ok, true}
+    else
+        {error, Reason} -> {error, Reason}
     end.
 
 %% @doc Validate that an assignment is trusted based on scheduler constraints.
