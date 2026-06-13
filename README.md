@@ -20,9 +20,9 @@ rebar3 device verify
 ```bash
 device publish: security@1.0 
 
-spec=nBOP6OZzNi-3oYP8TC4VClwCa_q_AhADilcNrFDYhjE 
+spec=5SlEeM7ekQbye0I_H0IbM7ehO4U2LEkeqlfCvnTZlYg 
 
-impl=t0UTvqWtUT2ohVw-bWPdnjbVCL2tPLFFmJAqBiFWmeY 
+impl=ARgymad5oYZcWPpxuV-A9hoSgmm4ElgPIvxMwmeh674 
 
 signer=vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
 ```
