@@ -108,7 +108,7 @@ validate(Key, Base, SubjectMsg, Opts) ->
 validate(Key, Base, SubjectMsg, RawFrom, Opts) ->
     maybe
         true ?=
-            case is_prod_mode(Opts) of
+            case requires_explicit_policy(Key, Opts) of
                 true ->
                     has_explicit_policy(Key, Base, Opts)
                         orelse {error, <<"Security policy not configured.">>};
@@ -148,7 +148,12 @@ validate(Key, Base, SubjectMsg, RawFrom, Opts) ->
             Opts
         ),
         satisfies_constraints(Key, From, RequiredList, Valid, Match, Opts)
-end.
+    end.
+
+requires_explicit_policy(<<"set-authority">>, _Opts) ->
+    true;
+requires_explicit_policy(_Key, Opts) ->
+    is_prod_mode(Opts).
 
 is_prod_mode(Opts) ->
     case maps:get(dev_security_mode, Opts, maps:get(<<"dev-security-mode">>, Opts, dev)) of

@@ -70,6 +70,40 @@ validate_route_uses_explicit_from_vector_test() ->
         )
     ).
 
+raw_set_authority_static_policy_allows_exact_from_vector_test() ->
+    Opts = opts(),
+    Authority = <<1:256>>,
+    ?assertEqual(
+        {ok, true},
+        validate(
+            <<"set-authority">>,
+            #{ <<"set-authority">> => Authority },
+            Authority,
+            Opts
+        )
+    ).
+
+raw_set_authority_static_policy_rejects_non_matching_from_vector_test() ->
+    Opts = opts(),
+    Authority = <<1:256>>,
+    Other = <<2:256>>,
+    ?assertEqual(
+        {error, <<"Too few acceptable committers present.">>},
+        validate(
+            <<"set-authority">>,
+            #{ <<"set-authority">> => Authority },
+            Other,
+            Opts
+        )
+    ).
+
+set_authority_requires_policy_even_in_dev_mode_vector_test() ->
+    Opts = opts(),
+    ?assertEqual(
+        {error, <<"Security policy not configured.">>},
+        validate(<<"set-authority">>, #{}, <<"alice">>, Opts)
+    ).
+
 prod_mode_requires_explicit_policy_vector_test() ->
     Opts = (opts())#{ dev_security_mode => prod },
     ?assertEqual(
@@ -90,4 +124,3 @@ prod_mode_allows_explicit_single_signer_policy_vector_test() ->
             Opts
         )
     ).
-
