@@ -10,6 +10,32 @@
 -implements(<<"security@1.0">>).
 %%% Device API.
 -export([info/0, compute/3, validate/3]).
+%%% Public helpers.
+-export([validate_address/2]).
+
+%% @doc `validate_address/3` built-in reserved keys list. Keep in sync with
+%% token address validation for balance-backed security templates.
+-define(AO_RESERVED_ADDRESS_KEYS,
+    [
+        <<"path">>,
+        <<"get">>,
+        <<"set">>,
+        <<"remove">>,
+        <<"verify">>,
+        <<"keys">>,
+        <<"id">>,
+        <<"commit">>,
+        <<"committed">>,
+        <<"committers">>,
+        <<"index">>,
+        <<"info">>,
+        <<"set_path">>,
+        <<"reserved_keys">>,
+        <<"is_reserved_key">>,
+        <<"dedup">>,
+        <<"dedup-subject">>
+    ]
+).
 
 %% @doc Return the public security device API.
 info() ->
@@ -106,11 +132,15 @@ validate_authority(Base, Assignment, Opts) ->
 validate(Key, Base, SubjectMsg, Opts) ->
     validate(Key, Base, SubjectMsg, hb_message:signers(SubjectMsg, Opts), Opts).
 validate(Key, Base, SubjectMsg, RawFrom, Opts) ->
+    Template = security_template(Key, Base, Opts),
+    validate_with_template(Template, Key, Base, SubjectMsg, RawFrom, Opts).
+
+validate_with_template(<<"static-signer-set">>, Key, Base, SubjectMsg, RawFrom, Opts) ->
     maybe
         true ?=
-            case is_prod_mode(Opts) of
+            case requires_static_policy(Key, Opts) of
                 true ->
-                    has_explicit_policy(Key, Base, Opts)
+                    has_static_signer_policy(Key, Base, Opts)
                         orelse {error, <<"Security policy not configured.">>};
                 false ->
                     true
@@ -127,6 +157,7 @@ validate(Key, Base, SubjectMsg, RawFrom, Opts) ->
             ),
         true ?= is_list(RequiredListOrError) orelse RequiredListOrError,
         RequiredList = lists:uniq(RequiredListOrError),
+        true ?= valid_static_signer_policy(Key, Base, Valid, RequiredList, Opts),
         DefaultThresholdN = case length(Valid) of
             0 -> 0;
             _ -> 1
@@ -148,7 +179,60 @@ validate(Key, Base, SubjectMsg, RawFrom, Opts) ->
             Opts
         ),
         satisfies_constraints(Key, From, RequiredList, Valid, Match, Opts)
-end.
+    end;
+validate_with_template(<<"supply-threshold-owner">>, Key, _Base, _SubjectMsg, _RawFrom, _Opts)
+        when Key =/= <<"set-authority">> ->
+    {error, <<"Supply-threshold owner template only supports set-authority.">>};
+validate_with_template(<<"supply-threshold-owner">>, Key, Base, _SubjectMsg, RawFrom, Opts) ->
+    maybe
+        true ?= (not has_static_policy(Key, Base, Opts))
+            orelse {error, <<"Ambiguous security policy configuration.">>},
+        {ok, Candidate} ?= single_authority_candidate(RawFrom, Opts),
+        {ok, Balance} ?= candidate_balance(Candidate, Base, Opts),
+        {ok, TotalSupply} ?= total_supply(Base, Opts),
+        {ok, ThresholdBps} ?= threshold_bps(Key, Base, Opts),
+        true ?= (Balance =< TotalSupply)
+            orelse {error, <<"Balance exceeds total supply.">>},
+        Res =
+            (Balance * 10000 >= TotalSupply * ThresholdBps)
+            orelse {error, <<"Supply-threshold owner requirement not satisfied.">>},
+        ?event(
+            security_short,
+            {supply_threshold_owner_check,
+                {intent, Key},
+                {candidate, Candidate},
+                {balance, Balance},
+                {total_supply, TotalSupply},
+                {threshold_bps, ThresholdBps},
+                {result, Res}
+            },
+            Opts
+        ),
+        Res
+    end;
+validate_with_template(_Template, _Key, _Base, _SubjectMsg, _RawFrom, _Opts) ->
+    {error, <<"Unknown security template.">>}.
+
+security_template(Key, Base, Opts) ->
+    case hb_ao:get(<<Key/binary, "-template">>, Base, not_found, Opts) of
+        not_found ->
+            default_template(Key, Base, Opts);
+        Template ->
+            Template
+    end.
+
+default_template(<<"set-authority">>, Base, Opts) ->
+    case has_static_policy(<<"set-authority">>, Base, Opts) of
+        true -> <<"static-signer-set">>;
+        false -> <<"supply-threshold-owner">>
+    end;
+default_template(_Key, _Base, _Opts) ->
+    <<"static-signer-set">>.
+
+requires_static_policy(<<"set-authority">>, _Opts) ->
+    true;
+requires_static_policy(_Key, Opts) ->
+    is_prod_mode(Opts).
 
 is_prod_mode(Opts) ->
     case maps:get(dev_security_mode, Opts, maps:get(<<"dev-security-mode">>, Opts, dev)) of
@@ -157,10 +241,153 @@ is_prod_mode(Opts) ->
         _ -> false
     end.
 
-has_explicit_policy(Key, Base, Opts) ->
+has_static_policy(Key, Base, Opts) ->
     hb_ao:get(Key, Base, not_found, Opts) =/= not_found orelse
     hb_ao:get(<<Key/binary, "-required">>, Base, not_found, Opts) =/= not_found orelse
     hb_ao:get(<<Key/binary, "-match">>, Base, not_found, Opts) =/= not_found.
+
+has_static_signer_policy(Key, Base, Opts) ->
+    hb_ao:get(Key, Base, not_found, Opts) =/= not_found orelse
+    hb_ao:get(<<Key/binary, "-required">>, Base, not_found, Opts) =/= not_found.
+
+valid_static_signer_policy(Key, Base, Valid, Required, Opts) ->
+    case requires_static_policy(Key, Opts) orelse has_static_policy(Key, Base, Opts) of
+        false ->
+            true;
+        true ->
+            case Valid ++ Required of
+                [] ->
+                    {error, <<"Security policy not configured.">>};
+                Signers ->
+                    lists:all(fun valid_static_signer/1, Signers)
+                        orelse {error, <<"Security signer cannot be empty.">>}
+            end
+    end.
+
+valid_static_signer(Signer) when is_binary(Signer) ->
+    byte_size(Signer) > 0;
+valid_static_signer(_Signer) ->
+    true.
+
+single_authority_candidate(RawFrom, Opts) ->
+    case lists:uniq(as_list(RawFrom, Opts)) of
+        [Candidate] ->
+            maybe
+                true ?= validate_address(Candidate, [], Opts),
+                {ok, Candidate}
+            end;
+        [] ->
+            {error, <<"Authority candidate not found.">>};
+        _ ->
+            {error, <<"Supply-threshold owner requires exactly one candidate.">>}
+    end.
+
+candidate_balance(Candidate, Base, Opts) ->
+    case hb_ao:get(<<"balances">>, Base, not_found, Opts) of
+        not_found ->
+            {error, <<"Balances not configured.">>};
+        Balances ->
+            Account = account_key(Candidate),
+            case hb_ao:resolve(Balances, Account, Opts) of
+                {ok, Balance} when is_integer(Balance), Balance >= 0 ->
+                    {ok, Balance};
+                {ok, Balance} when is_integer(Balance) ->
+                    {error, <<"Balance cannot be negative.">>};
+                {ok, _Balance} ->
+                    {error, <<"Balance must be an integer.">>};
+                {error, not_found} ->
+                    {ok, 0};
+                {error, Reason} ->
+                    {error, Reason}
+            end
+    end.
+
+total_supply(Base, Opts) ->
+    case hb_ao:get(<<"total-supply">>, Base, not_found, Opts) of
+        TotalSupply when is_integer(TotalSupply), TotalSupply > 0 ->
+            {ok, TotalSupply};
+        TotalSupply when is_integer(TotalSupply) ->
+            {error, <<"Total supply must be positive.">>};
+        not_found ->
+            {error, <<"Total supply not configured.">>};
+        _ ->
+            {error, <<"Total supply must be an integer.">>}
+    end.
+
+threshold_bps(Key, Base, Opts) ->
+    ThresholdRaw = hb_ao:get(<<Key/binary, "-threshold-bps">>, Base, 10000, Opts),
+    case parse_integer(ThresholdRaw) of
+        ThresholdBps when
+                is_integer(ThresholdBps),
+                ThresholdBps >= 1,
+                ThresholdBps =< 10000 ->
+            {ok, ThresholdBps};
+        ThresholdBps when is_integer(ThresholdBps) ->
+            {error, <<"Threshold basis points out of range.">>};
+        Error ->
+            Error
+    end.
+
+parse_integer(Value) when is_integer(Value) ->
+    Value;
+parse_integer(Value) when is_binary(Value) ->
+    try binary_to_integer(Value) of
+        Int -> Int
+    catch
+        _:_ -> {error, <<"Integer value is invalid.">>}
+    end;
+parse_integer(_Value) ->
+    {error, <<"Integer value is invalid.">>}.
+
+account_key(Account) when is_binary(Account) ->
+    hb_util:to_lower(Account).
+
+%% @doc Validate address format for security. The validation allows binary
+%% addresses up to 128 bytes and prevents invalid addresses such as trie
+%% reserved keys.
+validate_address(Address, CustomList) ->
+    validate_address(Address, CustomList, #{}).
+
+validate_address(Address, CustomList, Opts) when is_binary(Address), is_list(CustomList) ->
+    ReservedKeys = ?AO_RESERVED_ADDRESS_KEYS ++ CustomList,
+    AccountKey = account_key(Address),
+    CanonicalReservedKeys = [account_key(Key) || Key <- ReservedKeys, is_binary(Key)],
+    case byte_size(Address) of
+        0 -> {error, <<"Address cannot be empty.">>};
+        N when N > 128 -> {error, <<"Address is too long.">>};
+        _ ->
+            TrieReservedKeys = trie_reserved_keys(Opts),
+            maybe
+                true ?= (not is_reserved_trie_key(Address, TrieReservedKeys))
+                    orelse {error, <<"Address uses a reserved trie internal key.">>},
+                true ?= (not is_reserved_trie_key(AccountKey, TrieReservedKeys))
+                    orelse {error, <<"Address uses a reserved trie internal key.">>},
+                true ?= (not is_reserved_custom_key(Address, ReservedKeys))
+                    orelse {error, <<"Address is a reserved ao/custom key">>},
+                true ?= (not is_reserved_custom_key(AccountKey, CanonicalReservedKeys))
+                    orelse {error, <<"Address is a reserved ao/custom key">>},
+                % Check for path separators (security: prevent path traversal) and whitespaces.
+                case binary:match(Address, [<<"/">>, <<"\\">>, <<" ">>, <<"\n">>, <<"\r">>, <<"\t">>]) of
+                    nomatch -> true;
+                    _ -> {error, <<"Address cannot contain path separators or whitespaces">>}
+                end
+            end
+    end;
+validate_address(_, _, _) ->
+    {error, <<"Address must be a binary.">>}.
+
+is_reserved_trie_key(Key, ReservedKeys) ->
+    lists:member(Key, ReservedKeys).
+
+trie_reserved_keys(Opts) ->
+    {ok, Trie} = hb_device_load:reference(<<"trie@1.0">>, Opts),
+    maps:get(reserved, Trie:info(), []).
+
+%% @doc Check if the given Key exists in the passed List.
+is_reserved_custom_key(Key, List) when is_binary(Key), is_list(List) ->
+    lists:member(Key, List);
+is_reserved_custom_key(_, _) ->
+    false.
 
 %% @doc Validate that the request satisfies the given constraints.
 %% Returns true if:
