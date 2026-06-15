@@ -44,9 +44,9 @@ rebar3 device verify
 ```bash
 device publish: security@1.0 
 
-spec=5SlEeM7ekQbye0I_H0IbM7ehO4U2LEkeqlfCvnTZlYg 
+spec=qtC0Ae3Yt78mN8jqWG2dH14grcUK9CKhAtd3dsJ-ft0 
 
-impl=ARgymad5oYZcWPpxuV-A9hoSgmm4ElgPIvxMwmeh674 
+impl=cfKDo4KvBzje-teLrwcLn98LY7DeecFdX1r7HgEcGtI 
 
 signer=vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
 ```
