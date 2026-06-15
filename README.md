@@ -69,3 +69,6 @@ rebar3 device local
 ```sh
 rebar3 device publish --key wallet.json
 ```
+
+## license
+this pakcage is licensed under the [MIT License](./LICENSE)
