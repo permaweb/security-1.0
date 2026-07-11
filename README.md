@@ -35,8 +35,8 @@ rebar3 compile
 ## package
 
 ```sh
-rebar3 device package
-rebar3 device verify
+rebar3 device package --device-src=src,_build/default/lib/hb/src/preloaded/token
+rebar3 device verify --device-src=src,_build/default/lib/hb/src/preloaded/token
 ```
 
 ## published package
@@ -44,9 +44,9 @@ rebar3 device verify
 ```bash
 device publish: security@1.0 
 
-spec=qtC0Ae3Yt78mN8jqWG2dH14grcUK9CKhAtd3dsJ-ft0 
+spec=yOSyw6hyPXKWCALc5mnqlldNAvVEHUwb_HOyIlYTyEo 
 
-impl=cfKDo4KvBzje-teLrwcLn98LY7DeecFdX1r7HgEcGtI 
+impl=b7Vxz1lKhQgMQYXPizAc3N3bFMU8h8U5meoECG265qc 
 
 signer=vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
 ```
@@ -67,7 +67,7 @@ rebar3 device local
 ## publish
 
 ```sh
-rebar3 device publish --key wallet.json
+rebar3 device publish --device-src=src,_build/default/lib/hb/src/preloaded/token --key wallet.json
 ```
 
 ## license

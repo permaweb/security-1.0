@@ -8,34 +8,11 @@
 -module(dev_security).
 -include_lib("hb/include/hb.hrl").
 -implements(<<"security@1.0">>).
+-device_libraries([lib_token]).
 %%% Device API.
 -export([info/0, compute/3, validate/3]).
 %%% Public helpers.
 -export([validate_address/2]).
-
-%% @doc `validate_address/3` built-in reserved keys list. Keep in sync with
-%% token address validation for balance-backed security templates.
--define(AO_RESERVED_ADDRESS_KEYS,
-    [
-        <<"path">>,
-        <<"get">>,
-        <<"set">>,
-        <<"remove">>,
-        <<"verify">>,
-        <<"keys">>,
-        <<"id">>,
-        <<"commit">>,
-        <<"committed">>,
-        <<"committers">>,
-        <<"index">>,
-        <<"info">>,
-        <<"set_path">>,
-        <<"reserved_keys">>,
-        <<"is_reserved_key">>,
-        <<"dedup">>,
-        <<"dedup-subject">>
-    ]
-).
 
 %% @doc Return the public security device API.
 info() ->
@@ -340,54 +317,13 @@ parse_integer(_Value) ->
     {error, <<"Integer value is invalid.">>}.
 
 account_key(Account) when is_binary(Account) ->
-    hb_util:to_lower(Account).
+    lib_token:account_key(Account).
 
-%% @doc Validate address format for security. The validation allows binary
-%% addresses up to 128 bytes and prevents invalid addresses such as trie
-%% reserved keys.
 validate_address(Address, CustomList) ->
-    validate_address(Address, CustomList, #{}).
+    lib_token:validate_address(Address, CustomList).
 
-validate_address(Address, CustomList, Opts) when is_binary(Address), is_list(CustomList) ->
-    ReservedKeys = ?AO_RESERVED_ADDRESS_KEYS ++ CustomList,
-    AccountKey = account_key(Address),
-    CanonicalReservedKeys = [account_key(Key) || Key <- ReservedKeys, is_binary(Key)],
-    case byte_size(Address) of
-        0 -> {error, <<"Address cannot be empty.">>};
-        N when N > 128 -> {error, <<"Address is too long.">>};
-        _ ->
-            TrieReservedKeys = trie_reserved_keys(Opts),
-            maybe
-                true ?= (not is_reserved_trie_key(Address, TrieReservedKeys))
-                    orelse {error, <<"Address uses a reserved trie internal key.">>},
-                true ?= (not is_reserved_trie_key(AccountKey, TrieReservedKeys))
-                    orelse {error, <<"Address uses a reserved trie internal key.">>},
-                true ?= (not is_reserved_custom_key(Address, ReservedKeys))
-                    orelse {error, <<"Address is a reserved ao/custom key">>},
-                true ?= (not is_reserved_custom_key(AccountKey, CanonicalReservedKeys))
-                    orelse {error, <<"Address is a reserved ao/custom key">>},
-                % Check for path separators (security: prevent path traversal) and whitespaces.
-                case binary:match(Address, [<<"/">>, <<"\\">>, <<" ">>, <<"\n">>, <<"\r">>, <<"\t">>]) of
-                    nomatch -> true;
-                    _ -> {error, <<"Address cannot contain path separators or whitespaces">>}
-                end
-            end
-    end;
-validate_address(_, _, _) ->
-    {error, <<"Address must be a binary.">>}.
-
-is_reserved_trie_key(Key, ReservedKeys) ->
-    lists:member(Key, ReservedKeys).
-
-trie_reserved_keys(Opts) ->
-    {ok, Trie} = hb_device_load:reference(<<"trie@1.0">>, Opts),
-    maps:get(reserved, Trie:info(), []).
-
-%% @doc Check if the given Key exists in the passed List.
-is_reserved_custom_key(Key, List) when is_binary(Key), is_list(List) ->
-    lists:member(Key, List);
-is_reserved_custom_key(_, _) ->
-    false.
+validate_address(Address, CustomList, Opts) ->
+    lib_token:validate_address(Address, CustomList, Opts).
 
 %% @doc Validate that the request satisfies the given constraints.
 %% Returns true if:
