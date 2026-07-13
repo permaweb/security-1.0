@@ -53,6 +53,41 @@ canonical_balances(Balances) ->
 account_key(Account) ->
     hb_util:to_lower(Account).
 
+signer() ->
+    Wallet = ar_wallet:new(),
+    {hb_util:human_id(ar_wallet:to_address(Wallet)), Wallet}.
+
+sign_subject(Body, RawWallets, Opts) ->
+    Wallets = case RawWallets of
+        List when is_list(List) -> List;
+        Wallet -> [Wallet]
+    end,
+    lists:foldl(
+        fun(Wallet, Msg) ->
+            hb_message:commit(Msg, Opts#{ <<"priv-wallet">> => Wallet })
+        end,
+        Body,
+        Wallets
+    ).
+
+cache_roundtrip(Msg, Opts) ->
+    {ok, _} = hb_cache:write(Msg, Opts),
+    {ok, Cached} = hb_cache:read(hb_message:id(Msg, all, Opts), Opts),
+    hb_cache:ensure_all_loaded(Cached, Opts).
+
+sign_assignment(Body, BodyWallets, SchedulerWallet, Opts) ->
+    SignedBody = sign_subject(Body, BodyWallets, Opts),
+    sign_subject(
+        #{
+            <<"path">> => <<"compute">>,
+            <<"type">> => <<"Assignment">>,
+            <<"slot">> => 0,
+            <<"body">> => SignedBody
+        },
+        SchedulerWallet,
+        Opts
+    ).
+
 duplicate_authority_match_rejected_vector_test() ->
     Opts = opts(),
     ?assertEqual(
@@ -95,6 +130,223 @@ validate_route_uses_explicit_from_vector_test() ->
             <<"alice">>,
             Opts
         )
+    ).
+
+compute_hydrates_two_of_three_assignment_body_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {AdminA, AdminAWallet} = signer(),
+    {AdminB, AdminBWallet} = signer(),
+    {AdminC, _AdminCWallet} = signer(),
+    Body =
+        sign_subject(
+            #{ <<"action">> => <<"Set">> },
+            [AdminAWallet, AdminBWallet],
+            Opts
+        ),
+    Assignment =
+        sign_subject(
+            #{
+                <<"path">> => <<"compute">>,
+                <<"type">> => <<"Assignment">>,
+                <<"slot">> => 0,
+                <<"body">> => Body
+            },
+            SchedulerWallet,
+            Opts
+        ),
+    CachedAssignment = cache_roundtrip(Assignment, Opts),
+    CachedBody = hb_ao:get(<<"body">>, CachedAssignment, Opts),
+    ?assertEqual([], hb_message:signers(CachedBody, Opts)),
+    ?assertNot(hb_message:verify(CachedAssignment, signers, Opts)),
+    {ok, SecuredAssignment} =
+        hb_ao:resolve(
+            base(#{ <<"scheduler">> => Scheduler }),
+            CachedAssignment,
+            Opts
+        ),
+    From = hb_ao:get(<<"body/from">>, SecuredAssignment, Opts),
+    ?assertEqual(lists:sort([AdminA, AdminB]), lists:sort(From)),
+    ?assertEqual(
+        {ok, true},
+        validate(
+            <<"set-authority">>,
+            #{
+                <<"set-authority">> => [AdminA, AdminB, AdminC],
+                <<"set-authority-match">> => 2
+            },
+            From,
+            Opts
+        )
+    ).
+
+delegated_transfer_action_allowed_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<"tRaNsFeR">>,
+                <<"from-process">> => DelegatedSender
+            },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    {ok, SecuredAssignment} =
+        hb_ao:resolve(
+            base(
+                #{
+                    <<"scheduler">> => Scheduler,
+                    <<"authority">> => Scheduler,
+                    <<"authority-actions">> => [<<"Transfer">>]
+                }
+            ),
+            Assignment,
+            Opts
+        ),
+    ?assertEqual(
+        DelegatedSender,
+        hb_ao:get(<<"body/from">>, SecuredAssignment, Opts)
+    ).
+
+delegated_mint_action_rejected_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<"Mint">>,
+                <<"from-process">> => DelegatedSender
+            },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(
+            base(
+                #{
+                    <<"scheduler">> => Scheduler,
+                    <<"authority">> => Scheduler,
+                    <<"authority-actions">> => [<<"Transfer">>]
+                }
+            ),
+            Assignment,
+            Opts
+        )
+    ).
+
+delegated_action_policy_requires_list_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<"Transfer">>,
+                <<"from-process">> => DelegatedSender
+            },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    Policy =
+        #{
+            <<"scheduler">> => Scheduler,
+            <<"authority">> => Scheduler
+        },
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(base(Policy), Assignment, Opts)
+    ),
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(
+            base(Policy#{ <<"authority-actions">> => <<"Transfer">> }),
+            Assignment,
+            Opts
+        )
+    ).
+
+delegated_message_requires_action_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{ <<"from-process">> => DelegatedSender },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(
+            base(
+                #{
+                    <<"scheduler">> => Scheduler,
+                    <<"authority">> => Scheduler,
+                    <<"authority-actions">> => [<<"Transfer">>]
+                }
+            ),
+            Assignment,
+            Opts
+        )
+    ).
+
+delegated_invalid_action_rejected_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<255>>,
+                <<"from-process">> => DelegatedSender
+            },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(
+            base(
+                #{
+                    <<"scheduler">> => Scheduler,
+                    <<"authority">> => Scheduler,
+                    <<"authority-actions">> => [<<"Transfer">>]
+                }
+            ),
+            Assignment,
+            Opts
+        )
+    ).
+
+wallet_action_does_not_require_delegated_policy_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {WalletAddress, Wallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{ <<"action">> => <<"Mint">> },
+            Wallet,
+            SchedulerWallet,
+            Opts
+        ),
+    {ok, SecuredAssignment} =
+        hb_ao:resolve(
+            base(#{ <<"scheduler">> => Scheduler }),
+            Assignment,
+            Opts
+        ),
+    ?assertEqual(
+        WalletAddress,
+        hb_ao:get(<<"body/from">>, SecuredAssignment, Opts)
     ).
 
 raw_set_authority_static_policy_allows_exact_from_vector_test() ->

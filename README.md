@@ -26,6 +26,12 @@ current templates:
 
 mixing static `set-authority` keys with `supply-threshold-owner` is rejected
 
+## delegated process actions
+
+Messages with `from-process` must satisfy both the `authority` signer policy and the `authority-actions` action allowlist. The allowlist must be a non-empty list of non-empty binaries and compares actions case-insensitively. A missing or malformed policy fails closed.
+
+This policy only applies to process-delegated identity. Direct wallet messages derive `from` from their verified signers and do not require `authority-actions`.
+
 ## build
 
 ```sh

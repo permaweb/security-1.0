@@ -24,7 +24,8 @@ info() ->
 compute(Base, Req, Opts) ->
     ?event(security_debug, {compute_called, {base, Base}, {req, Req}}, Opts),
     maybe
-        {ok, SecureReq1} ?= validate_assignment(Base, Req, Opts),
+        {ok, HydratedReq} ?= hydrate_assignment_body(Req, Opts),
+        {ok, SecureReq1} ?= validate_assignment(Base, HydratedReq, Opts),
         {ok, _SecureReq2} ?= validate_authority(Base, SecureReq1, Opts)
     else
         {error, Reason} ->
@@ -38,6 +39,24 @@ compute(Base, Req, Opts) ->
             ),
             {skip, Reason}
     end.
+
+%% @doc Restore a cache-linked body's commitment set before verifying the
+%% scheduler's commitment over the Assignment. A raw map update is intentional:
+%% `hb_ao:set' would invalidate the outer commitment we are reconstructing.
+hydrate_assignment_body(Assignment, Opts) when is_map(Assignment) ->
+    case hb_ao:get(<<"body">>, Assignment, not_found, Opts) of
+        Body when is_map(Body) ->
+            case hydrate_subject(Body, Opts) of
+                {ok, HydratedBody} ->
+                    {ok, Assignment#{ <<"body">> => HydratedBody }};
+                {error, _} = Error ->
+                    Error
+            end;
+        _ ->
+            {error, <<"Security subject must be a message.">>}
+    end;
+hydrate_assignment_body(_Assignment, _Opts) ->
+    {error, <<"Security subject must be a message.">>}.
 
 %% @doc Validate a caller-controlled security intent through the device API.
 %% Expected request keys:
@@ -64,11 +83,12 @@ validate(Base, Req, Opts) ->
 
 %% @doc Validate that an assignment is trusted based on scheduler constraints.
 validate_assignment(Base, Assignment, Opts) ->
-    case validate(<<"scheduler">>, Base, Assignment, Opts) of
-        true ->
-            {ok, Assignment};
-        {error, Reason} ->
-            {error, Reason}
+    maybe
+        {ok, Signers} ?= verified_signers(Assignment, Opts),
+        true ?= validate(<<"scheduler">>, Base, Assignment, Signers, Opts),
+        {ok, Assignment}
+    else
+        {error, Reason} -> {error, Reason}
     end.
 
 %% @doc Validate that a request has proper authority, adding a `from' key to the
@@ -76,32 +96,62 @@ validate_assignment(Base, Assignment, Opts) ->
 %% (for replies, etc) -- whether an end-user wallet or another process.
 validate_authority(Base, Assignment, Opts) ->
     Msg = hb_ao:get(<<"body">>, Assignment, undefined, Opts),
-    Signers = hb_message:signers(Msg, Opts),
-    case hb_ao:get(<<"from-process">>, Msg, undefined, Opts) of
-        undefined ->
-            {
-                ok,
-                hb_ao:set(
-                    Assignment,
-                    <<"body/from">>,
-                    maybe_single(Signers, Opts),
-                    Opts
-                )
-            };
-        Sender ->
-            case validate(<<"authority">>, Base, Msg, Opts) of
-                true ->
-                    {
-                        ok,
-                        hb_ao:set(
-                            Assignment,
-                            <<"body/from">>,
-                            Sender,
-                            Opts
-                        )
-                    };
-                {error, Reason} -> {error, Reason}
-            end
+    maybe
+        {ok, Signers} ?= verified_signers(Msg, Opts),
+        case hb_ao:get(<<"from-process">>, Msg, undefined, Opts) of
+            undefined ->
+                {
+                    ok,
+                    hb_ao:set(
+                        Assignment,
+                        <<"body/from">>,
+                        maybe_single(Signers, Opts),
+                        Opts
+                    )
+                };
+            Sender ->
+                case validate(<<"authority">>, Base, Msg, Signers, Opts) of
+                    true ->
+                        case validate_authority_action(Base, Msg, Opts) of
+                            true ->
+                                {
+                                    ok,
+                                    hb_ao:set(
+                                        Assignment,
+                                        <<"body/from">>,
+                                        Sender,
+                                        Opts
+                                    )
+                                };
+                            {error, Reason} -> {error, Reason}
+                        end;
+                    {error, Reason} -> {error, Reason}
+                end
+        end
+    end.
+
+%% @doc Restrict process-delegated identities to explicitly configured actions.
+%% Wallet-signed messages do not carry `from-process' and do not enter this path.
+validate_authority_action(Base, Msg, Opts) ->
+    try
+        Action = hb_ao:get(<<"action">>, Msg, not_found, Opts),
+        Allowed = hb_ao:get(<<"authority-actions">>, Base, [], Opts),
+        Valid =
+            is_binary(Action) andalso byte_size(Action) > 0 andalso
+                is_list(Allowed) andalso Allowed =/= [] andalso
+                lists:all(
+                    fun(Item) -> is_binary(Item) andalso byte_size(Item) > 0 end,
+                    Allowed
+                ),
+        case Valid andalso lists:member(
+            hb_util:to_lower(Action),
+            [hb_util:to_lower(Item) || Item <- Allowed]
+        ) of
+            true -> true;
+            false -> {error, <<"Delegated action not allowed.">>}
+        end
+    catch
+        _:_ -> {error, <<"Delegated action not allowed.">>}
     end.
 
 %% @doc If a message purporting to be from a process satisfies the compute
@@ -111,6 +161,42 @@ validate(Key, Base, SubjectMsg, Opts) ->
 validate(Key, Base, SubjectMsg, RawFrom, Opts) ->
     Template = security_template(Key, Base, Opts),
     validate_with_template(Template, Key, Base, SubjectMsg, RawFrom, Opts).
+
+%% @doc Return only signer identities whose commitments verify against the
+%% subject. Signer metadata alone is not authentication and an empty signer set
+%% must never satisfy a security policy.
+verified_signers(SubjectMsg, Opts) when is_map(SubjectMsg) ->
+    try
+        Signers = lists:uniq(hb_message:signers(SubjectMsg, Opts)),
+        case Signers of
+            [] ->
+                {error, <<"Security subject has no signers.">>};
+            _ ->
+                case hb_message:verify(SubjectMsg, Signers, Opts) of
+                    true -> {ok, Signers};
+                    false ->
+                        {error, <<"Security subject signature verification failed.">>}
+                end
+        end
+    catch
+        _:_ -> {error, <<"Security subject signature verification failed.">>}
+    end;
+verified_signers(_SubjectMsg, _Opts) ->
+    {error, <<"Security subject must be a message.">>}.
+
+%% @doc Explicit commitment reads are required for aggregate cache links. This
+%% helper is only used for a body bound by an outer Assignment commitment. Do not
+%% expand a body that already carries signers: doing so would allow a later
+%% commitment to change the signer set of an existing Assignment.
+hydrate_subject(SubjectMsg, Opts) ->
+    try
+        case hb_message:signers(SubjectMsg, Opts) of
+            [] -> {ok, hb_cache:read_all_commitments(SubjectMsg, Opts)};
+            _ -> {ok, SubjectMsg}
+        end
+    catch
+        _:_ -> {error, <<"Security subject signature verification failed.">>}
+    end.
 
 validate_with_template(<<"static-signer-set">>, Key, Base, SubjectMsg, RawFrom, Opts) ->
     maybe
