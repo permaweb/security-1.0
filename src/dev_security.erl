@@ -110,22 +110,20 @@ validate_authority(Base, Assignment, Opts) ->
                     )
                 };
             Sender ->
-                case validate(<<"authority">>, Base, Msg, Signers, Opts) of
-                    true ->
-                        case validate_authority_action(Base, Msg, Opts) of
-                            true ->
-                                {
-                                    ok,
-                                    hb_ao:set(
-                                        Assignment,
-                                        <<"body/from">>,
-                                        Sender,
-                                        Opts
-                                    )
-                                };
-                            {error, Reason} -> {error, Reason}
-                        end;
-                    {error, Reason} -> {error, Reason}
+                maybe
+                    true ?= (length(Signers) =:= 1) orelse
+                        {error, <<"Delegated messages require exactly one signer.">>},
+                    true ?= validate(<<"authority">>, Base, Msg, Signers, Opts),
+                    true ?= validate_authority_action(Base, Msg, Opts),
+                    {
+                        ok,
+                        hb_ao:set(
+                            Assignment,
+                            <<"body/from">>,
+                            Sender,
+                            Opts
+                        )
+                    }
                 end
         end
     end.

@@ -211,6 +211,36 @@ delegated_transfer_action_allowed_vector_test() ->
         hb_ao:get(<<"body/from">>, SecuredAssignment, Opts)
     ).
 
+delegated_extra_signer_rejected_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {_External, ExternalWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<"Transfer">>,
+                <<"from-process">> => DelegatedSender
+            },
+            [SchedulerWallet, ExternalWallet],
+            SchedulerWallet,
+            Opts
+        ),
+    Base =
+        base(
+            #{
+                <<"scheduler">> => Scheduler,
+                <<"authority">> => Scheduler,
+                <<"authority-actions">> => [<<"Transfer">>]
+            }
+        ),
+    Rejected = {skip, <<"Delegated messages require exactly one signer.">>},
+    ?assertEqual(Rejected, hb_ao:resolve(Base, Assignment, Opts)),
+    ?assertEqual(
+        Rejected,
+        hb_ao:resolve(Base, cache_roundtrip(Assignment, Opts), Opts)
+    ).
+
 delegated_mint_action_rejected_vector_test() ->
     Opts = opts(),
     {Scheduler, SchedulerWallet} = signer(),
