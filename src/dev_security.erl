@@ -111,6 +111,9 @@ validate_authority(Base, Assignment, Opts) ->
                 };
             Sender ->
                 maybe
+                    %% A delegated sender must be one valid identity, never a
+                    %% list interpreted as multiple authorization candidates.
+                    true ?= validate_address(Sender, [], Opts),
                     true ?= (length(Signers) =:= 1) orelse
                         {error, <<"Delegated messages require exactly one signer.">>},
                     true ?= validate(<<"authority">>, Base, Msg, Signers, Opts),
