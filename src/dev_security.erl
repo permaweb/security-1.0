@@ -9,6 +9,7 @@
 -include_lib("hb/include/hb.hrl").
 -implements(<<"security@1.0">>).
 -device_libraries([lib_token]).
+-define(MAX_EXACT_COMMITMENT_CANDIDATES, 12).
 %%% Device API.
 -export([info/0, compute/3, validate/3]).
 %%% Public helpers.
@@ -44,9 +45,10 @@ compute(Base, Req, Opts) ->
 %% scheduler's commitment over the Assignment. A raw map update is intentional:
 %% `hb_ao:set' would invalidate the outer commitment we are reconstructing.
 hydrate_assignment_body(Assignment, Opts) when is_map(Assignment) ->
+    BodyTargetID = assignment_body_target_id(Assignment, Opts),
     case hb_ao:get(<<"body">>, Assignment, not_found, Opts) of
         Body when is_map(Body) ->
-            case hydrate_subject(Body, Opts) of
+            case hydrate_subject(Body, BodyTargetID, Opts) of
                 {ok, HydratedBody} ->
                     {ok, Assignment#{ <<"body">> => HydratedBody }};
                 {error, _} = Error ->
@@ -182,19 +184,442 @@ verified_signers(SubjectMsg, Opts) when is_map(SubjectMsg) ->
 verified_signers(_SubjectMsg, _Opts) ->
     {error, <<"Security subject must be a message.">>}.
 
-%% @doc Explicit commitment reads are required for aggregate cache links. This
-%% helper is only used for a body bound by an outer Assignment commitment. Do not
-%% expand a body that already carries signers: doing so would allow a later
-%% commitment to change the signer set of an existing Assignment.
-hydrate_subject(SubjectMsg, Opts) ->
+%% @doc Ensure an Assignment body has the exact signer commitments needed for
+%% security validation.
+%%
+%% Scheduler-loaded Assignment bodies can arrive as unsigned content plus a link
+%% target that identifies the signed body the scheduler committed to. If the body
+%% already contains signer commitments, keep it unchanged. If it does not, hydrate
+%% only the commitment set for `BodyTargetID'. This is deliberately narrower than
+%% `hb_cache:read_all_commitments/2', which would load every cached commitment for
+%% the same unsigned body and could change the signer set of an older Assignment.
+hydrate_subject(SubjectMsg, BodyTargetID, Opts) ->
     try
         case hb_message:signers(SubjectMsg, Opts) of
-            [] -> {ok, hb_cache:read_all_commitments(SubjectMsg, Opts)};
+            [] -> hydrate_exact_subject(SubjectMsg, BodyTargetID, Opts);
             _ -> {ok, SubjectMsg}
         end
     catch
         _:_ -> {error, <<"Security subject signature verification failed.">>}
     end.
+
+%% @doc Attach the exact commitments for `BodyTargetID' to an unsigned subject.
+%% Without a body target from the Assignment there is no signed identity to
+%% recover, so failing closed is safer than falling back to all cached signatures.
+hydrate_exact_subject(_SubjectMsg, not_found, _Opts) ->
+    {error, <<"Security subject commitment target not found.">>};
+hydrate_exact_subject(SubjectMsg, BodyTargetID, Opts) ->
+    case exact_commitments(SubjectMsg, BodyTargetID, Opts) of
+        {ok, Commitments} ->
+            {ok, SubjectMsg#{ <<"commitments">> => Commitments }};
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Find the signed body target that the Assignment points at.
+%% Prefer link metadata already present on the Assignment. If the body has been
+%% materialized and the link metadata was lost, reread the raw Assignment by its
+%% signed/all ID and inspect that cached raw form for the original body link.
+assignment_body_target_id(Assignment, Opts) ->
+    case body_target_id(Assignment, Opts) of
+        {ok, BodyTargetID} ->
+            BodyTargetID;
+        not_found ->
+            assignment_body_target_id_from_cache(Assignment, Opts)
+    end.
+
+%% @doc Recover body link metadata by rereading the raw Assignment from cache.
+%% This fallback exists because normal reads may materialize `body' as a map,
+%% while the raw cached Assignment can still expose `body+link' or lazy link
+%% structure that identifies the exact body commitment target.
+assignment_body_target_id_from_cache(Assignment, Opts) ->
+    try
+        AssignmentID =
+            hb_message:id(Assignment, all, Opts#{ <<"linkify-mode">> => discard }),
+        case hb_cache:read(AssignmentID, Opts#{ cache_read_mode => raw }) of
+            {ok, RawAssignment} ->
+                case body_target_id(RawAssignment, Opts) of
+                    {ok, BodyTargetID} -> BodyTargetID;
+                    not_found -> not_found
+                end;
+            _ ->
+                not_found
+        end
+    catch
+        _:_ -> not_found
+    end.
+
+%% @doc Extract the Assignment body's target ID from inline link metadata.
+%% The target ID may appear as a `body+link' sidecar, as a lazy `{link, ...}'
+%% tuple, or as a direct binary body value in raw cache-read mode.
+body_target_id(Assignment, Opts) ->
+    case maps:get(<<"body+link">>, Assignment, not_found) of
+        BodyTargetID when is_binary(BodyTargetID) ->
+            {ok, BodyTargetID};
+        _ ->
+            case maps:get(<<"body">>, Assignment, not_found) of
+                {link, ID, LinkOpts} ->
+                    link_target_id(ID, LinkOpts, Opts);
+                BodyTargetID when is_binary(BodyTargetID) ->
+                    {ok, BodyTargetID};
+                _ ->
+                    not_found
+            end
+    end.
+
+%% @doc Resolve a body link to the binary target ID it names.
+%% Lazy links may point to another link, so this follows that chain until it
+%% reaches the real target. Non-lazy binary links already carry the target ID.
+link_target_id(ID, #{ <<"type">> := <<"link">>, <<"lazy">> := true } = LinkOpts, Opts) ->
+    case hb_cache:read(ID, hb_util:deep_merge(Opts, LinkOpts, Opts)) of
+        {ok, BodyTargetID} when is_binary(BodyTargetID) ->
+            {ok, BodyTargetID};
+        {ok, {link, NextID, NextOpts}} ->
+            link_target_id(NextID, NextOpts, Opts);
+        _ ->
+            not_found
+    end;
+link_target_id(ID, #{ <<"type">> := <<"link">> }, _Opts) when is_binary(ID) ->
+    {ok, ID};
+link_target_id(ID, _LinkOpts, _Opts) when is_binary(ID) ->
+    {ok, ID};
+link_target_id(_ID, _LinkOpts, _Opts) ->
+    not_found.
+
+%% @doc Read only the commitments that recreate `BodyTargetID'.
+%% Commitments are stored under the unsigned body root, but the Assignment points
+%% at a signed/all body target. This helper bridges those identities: locate the
+%% unsigned commitment group, choose the commitment IDs that correspond to the
+%% target, then read exactly those commitments.
+exact_commitments(SubjectMsg, BodyTargetID, Opts) ->
+    LocalOpts = hb_store:scope(Opts, local),
+    UncommittedID = commitment_root_id(SubjectMsg, BodyTargetID, Opts),
+    CommitmentsPath = hb_path:to_binary([UncommittedID, <<"commitments">>]),
+    case exact_commitment_ids(
+        CommitmentsPath,
+        BodyTargetID,
+        UncommittedID,
+        LocalOpts,
+        Opts
+    ) of
+        {ok, CommitmentIDs} ->
+            read_commitments(CommitmentsPath, CommitmentIDs, LocalOpts, Opts);
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Determine the unsigned root where the target body's commitments live.
+%% If the target ID can be read directly, derive the unsigned ID from that cached
+%% target. Otherwise fall back to the subject map we already have.
+commitment_root_id(SubjectMsg, BodyTargetID, Opts) ->
+    case hb_cache:read(BodyTargetID, Opts#{ cache_read_mode => raw }) of
+        {ok, TargetSubject} when is_map(TargetSubject) ->
+            hb_message:id(
+                TargetSubject,
+                none,
+                Opts#{ <<"linkify-mode">> => discard }
+            );
+        _ ->
+            hb_message:id(
+                SubjectMsg,
+                none,
+                Opts#{ <<"linkify-mode">> => discard }
+            )
+    end.
+
+%% @doc List candidate commitment IDs and choose the exact subset for the target.
+%% The commitment group can contain signatures from older or newer writes of the
+%% same unsigned body. We keep signer-bearing commitments separate from automatic
+%% non-signer commitments so signed/all matching is based on actual authorities.
+exact_commitment_ids(CommitmentsPath, BodyTargetID, RootID, LocalOpts, Opts) ->
+    case hb_store:list(CommitmentsPath, LocalOpts) of
+        {ok, RawCommitmentIDs} ->
+            CommitmentIDs =
+                lists:sort([
+                    hb_util:bin(commitment_child_name(RawCommitmentID))
+                ||
+                    RawCommitmentID <- RawCommitmentIDs
+                ]),
+            SignerCommitmentIDs =
+                signer_commitment_ids(
+                    CommitmentsPath,
+                    CommitmentIDs,
+                    LocalOpts,
+                    Opts
+                ),
+            find_commitment_ids(
+                BodyTargetID,
+                RootID,
+                CommitmentIDs,
+                SignerCommitmentIDs,
+                LocalOpts,
+                Opts
+            );
+        _ ->
+            {error, <<"Security subject commitments not found.">>}
+    end.
+
+%% @doc Filter commitment IDs down to commitments that carry a real signer.
+%% Automatic commitments, such as the constant AO HMAC commitment, are useful
+%% cache artifacts but are not security authorities.
+signer_commitment_ids(CommitmentsPath, CommitmentIDs, LocalOpts, Opts) ->
+    [
+        CommitmentID
+    ||
+        CommitmentID <- CommitmentIDs,
+        signer_commitment(CommitmentsPath, CommitmentID, LocalOpts, Opts)
+    ].
+
+%% @doc Return true when a stored commitment has a `committer' field.
+signer_commitment(CommitmentsPath, CommitmentID, LocalOpts, Opts) ->
+    CommitmentPath = hb_path:to_binary([CommitmentsPath, CommitmentID]),
+    case hb_cache:read(CommitmentPath, LocalOpts) of
+        {ok, Commitment} ->
+            LoadedCommitment =
+                hb_cache:ensure_all_loaded(
+                    Commitment,
+                    Opts#{ <<"commitment">> => true }
+                ),
+            is_binary(
+                hb_maps:get(<<"committer">>, LoadedCommitment, not_found, Opts)
+            );
+        _ ->
+            false
+    end.
+
+%% @doc Select the commitment IDs that correspond to the Assignment body target.
+%% First try to match the target ID by accumulating signer commitment IDs. If that
+%% cannot be proven, fall back to checking which accumulated signer subset is
+%% actually linked in cache to the same unsigned root.
+find_commitment_ids(
+    BodyTargetID,
+    RootID,
+    CommitmentIDs,
+    SignerCommitmentIDs,
+    LocalOpts,
+    Opts
+) ->
+    case length(CommitmentIDs) =< ?MAX_EXACT_COMMITMENT_CANDIDATES of
+        true ->
+            case find_aggregate_commitment_ids(BodyTargetID, SignerCommitmentIDs) of
+                {ok, _} = Ok ->
+                    Ok;
+                {error, _} = Error ->
+                    find_written_aggregate_commitment_ids(
+                        RootID,
+                        SignerCommitmentIDs,
+                        LocalOpts,
+                        Opts
+                    )
+            end;
+        false ->
+            {error, <<"Too many cached commitments for exact security hydration.">>}
+    end.
+
+%% @doc Find a signer subset whose accumulated ID equals `BodyTargetID'.
+%% This handles the normal case where the body target is the signed/all ID for
+%% one or more signer commitments.
+find_aggregate_commitment_ids(_BodyTargetID, []) ->
+    {error, <<"Exact security commitment set not found.">>};
+find_aggregate_commitment_ids(BodyTargetID, CommitmentIDs) ->
+    find_aggregate_commitment_ids(BodyTargetID, CommitmentIDs, 1, length(CommitmentIDs)).
+find_aggregate_commitment_ids(_BodyTargetID, _CommitmentIDs, Size, Max)
+        when Size > Max ->
+    {error, <<"Exact security commitment set not found.">>};
+find_aggregate_commitment_ids(BodyTargetID, CommitmentIDs, Size, Max) ->
+    case find_commitment_combination(BodyTargetID, Size, CommitmentIDs, []) of
+        {ok, Match} ->
+            {ok, Match};
+        not_found ->
+            find_aggregate_commitment_ids(BodyTargetID, CommitmentIDs, Size + 1, Max)
+    end.
+
+%% @doc Find a signer subset whose accumulated ID was written as an alt-ID link.
+%% This is a compatibility fallback for cases where the body target itself is not
+%% exactly the accumulated signer ID but the accumulated ID resolves to the same
+%% unsigned body root in cache.
+find_written_aggregate_commitment_ids(_RootID, [], _LocalOpts, _Opts) ->
+    {error, <<"Exact security commitment set not found.">>};
+find_written_aggregate_commitment_ids(RootID, SignerCommitmentIDs, LocalOpts, Opts) ->
+    Max = length(SignerCommitmentIDs),
+    case find_written_aggregate_commitment_ids(
+        RootID,
+        SignerCommitmentIDs,
+        2,
+        Max,
+        LocalOpts,
+        Opts
+    ) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, _} ->
+            find_written_aggregate_commitment_ids(
+                RootID,
+                SignerCommitmentIDs,
+                1,
+                1,
+                LocalOpts,
+                Opts
+            )
+    end.
+find_written_aggregate_commitment_ids(
+    _RootID,
+    _SignerCommitmentIDs,
+    Size,
+    Max,
+    _LocalOpts,
+    _Opts
+) when Size > Max ->
+    {error, <<"Exact security commitment set not found.">>};
+find_written_aggregate_commitment_ids(
+    RootID,
+    SignerCommitmentIDs,
+    Size,
+    Max,
+    LocalOpts,
+    Opts
+) ->
+    case find_written_commitment_combination(
+        RootID,
+        Size,
+        SignerCommitmentIDs,
+        [],
+        LocalOpts,
+        Opts
+    ) of
+        {ok, Match} ->
+            {ok, Match};
+        not_found ->
+            find_written_aggregate_commitment_ids(
+                RootID,
+                SignerCommitmentIDs,
+                Size + 1,
+                Max,
+                LocalOpts,
+                Opts
+            )
+    end.
+
+%% @doc Search combinations until one accumulates to `BodyTargetID'.
+find_commitment_combination(BodyTargetID, 0, _CommitmentIDs, Acc) ->
+    CommitmentIDs = lists:sort(Acc),
+    case aggregate_commitment_id(CommitmentIDs) of
+        BodyTargetID -> {ok, CommitmentIDs};
+        _ -> not_found
+    end;
+find_commitment_combination(_BodyTargetID, _Size, [], _Acc) ->
+    not_found;
+find_commitment_combination(BodyTargetID, Size, [CommitmentID | Rest], Acc)
+        when Size > 0 ->
+    case find_commitment_combination(BodyTargetID, Size - 1, Rest, [CommitmentID | Acc]) of
+        {ok, _} = Ok -> Ok;
+        not_found -> find_commitment_combination(BodyTargetID, Size, Rest, Acc)
+    end.
+
+%% @doc Search combinations until one resolves back to the unsigned root.
+find_written_commitment_combination(
+    RootID,
+    0,
+    _CommitmentIDs,
+    Acc,
+    LocalOpts,
+    Opts
+) ->
+    CommitmentIDs = lists:sort(Acc),
+    AggregateID = aggregate_commitment_id(CommitmentIDs),
+    case aggregate_resolves_to_root(AggregateID, RootID, LocalOpts, Opts) of
+        true -> {ok, CommitmentIDs};
+        false -> not_found
+    end;
+find_written_commitment_combination(
+    _RootID,
+    _Size,
+    [],
+    _Acc,
+    _LocalOpts,
+    _Opts
+) ->
+    not_found;
+find_written_commitment_combination(
+    RootID,
+    Size,
+    [CommitmentID | Rest],
+    Acc,
+    LocalOpts,
+    Opts
+) when Size > 0 ->
+    case find_written_commitment_combination(
+        RootID,
+        Size - 1,
+        Rest,
+        [CommitmentID | Acc],
+        LocalOpts,
+        Opts
+    ) of
+        {ok, _} = Ok ->
+            Ok;
+        not_found ->
+            find_written_commitment_combination(
+                RootID,
+                Size,
+                Rest,
+                Acc,
+                LocalOpts,
+                Opts
+            )
+    end.
+
+%% @doc Return true when a written accumulated ID links to the expected root.
+aggregate_resolves_to_root(AggregateID, RootID, LocalOpts, Opts) ->
+    case hb_cache:read(AggregateID, LocalOpts#{ cache_read_mode => raw }) of
+        {ok, TargetSubject} when is_map(TargetSubject) ->
+            hb_message:id(
+                TargetSubject,
+                none,
+                Opts#{ <<"linkify-mode">> => discard }
+            ) =:= RootID;
+        _ ->
+            false
+    end.
+
+%% @doc Derive the combined signed/all ID from a set of commitment IDs.
+aggregate_commitment_id(CommitmentIDs) ->
+    hb_util:human_id(
+        hb_crypto:accumulate(
+            [hb_util:native_id(CommitmentID) || CommitmentID <- lists:sort(CommitmentIDs)]
+        )
+    ).
+
+%% @doc Load the selected commitments from the unsigned commitment group.
+%% Unlike `read_all_commitments/2', this reads only the IDs selected by
+%% `exact_commitment_ids/5', preserving the Assignment's intended signer set.
+read_commitments(CommitmentsPath, CommitmentIDs, LocalOpts, Opts) ->
+    read_commitments(CommitmentsPath, CommitmentIDs, LocalOpts, Opts, []).
+read_commitments(_CommitmentsPath, [], _LocalOpts, _Opts, Acc) ->
+    {ok, maps:from_list(lists:reverse(Acc))};
+read_commitments(CommitmentsPath, [CommitmentID | Rest], LocalOpts, Opts, Acc) ->
+    CommitmentPath = hb_path:to_binary([CommitmentsPath, CommitmentID]),
+    case hb_cache:read(CommitmentPath, LocalOpts) of
+        {ok, Commitment} ->
+            LoadedCommitment =
+                hb_cache:ensure_all_loaded(
+                    Commitment,
+                    Opts#{ <<"commitment">> => true }
+                ),
+            read_commitments(
+                CommitmentsPath,
+                Rest,
+                LocalOpts,
+                Opts,
+                [{CommitmentID, LoadedCommitment} | Acc]
+            );
+        _ ->
+            {error, <<"Security subject commitment not found.">>}
+    end.
+
+%% @doc Normalize store-list entries to the actual child path name.
+commitment_child_name({Subpath, _Value}) -> Subpath;
+commitment_child_name(Subpath) -> Subpath.
 
 validate_with_template(<<"static-signer-set">>, Key, Base, SubjectMsg, RawFrom, Opts) ->
     maybe
