@@ -48,13 +48,13 @@ rebar3 device verify --device-src=src,_build/default/lib/hb/src/preloaded/token
 ## published package
 
 ```bash
-device publish: security@1.0 
+Published device: security@1.0; 
 
-spec=yOSyw6hyPXKWCALc5mnqlldNAvVEHUwb_HOyIlYTyEo 
+Specification ID: 5mlYtrYWAVPBHXMqtgjEb8ES8WyBkGJBKXbYDryohtg; 
 
-impl=b7Vxz1lKhQgMQYXPizAc3N3bFMU8h8U5meoECG265qc 
+Implementation ID: Tt9h03Q3QMg4F30kVs9sCij8meZR5UIhJPcEq4n6Bx0; 
 
-signer=vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
+Signer: vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
 ```
 
 ## test
