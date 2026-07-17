@@ -614,7 +614,7 @@ set_authority_match_only_static_policy_rejected_vector_test() ->
 set_authority_supply_owner_rejects_path_candidate_vector_test() ->
     Opts = opts(),
     ?assertEqual(
-        {error, <<"Address cannot contain path separators or whitespaces">>},
+        {error, <<"Address contains unsupported characters.">>},
         validate(
             <<"set-authority">>,
             token_policy(#{ <<"alice">> => 10 }, 10, Opts),

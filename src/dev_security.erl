@@ -12,7 +12,7 @@
 %%% Device API.
 -export([info/0, compute/3, validate/3]).
 %%% Public helpers.
--export([validate_address/2]).
+-export([validate_address/3]).
 
 %% @doc Return the public security device API.
 info() ->
@@ -405,9 +405,6 @@ parse_integer(_Value) ->
 
 account_key(Account) when is_binary(Account) ->
     lib_token:account_key(Account).
-
-validate_address(Address, CustomList) ->
-    lib_token:validate_address(Address, CustomList).
 
 validate_address(Address, CustomList, Opts) ->
     lib_token:validate_address(Address, CustomList, Opts).
