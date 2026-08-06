@@ -50,9 +50,9 @@ rebar3 device verify --device-src=src,_build/default/lib/hb/src/preloaded/token
 ```bash
 Published device: security@1.0; 
 
-Specification ID: KWnYM2g-rCs8spmjTv2QntG-d9-C_CS5Xl1vdSn-7CQ; 
+Specification ID: hgSW1CXBL_nqkRbgGRxKuj1j7SFbC1Sbfa4uY7t58tU; 
 
-Implementation ID: 7jivsYHKbkfca8emXGepD-T0KQ6cI7ehGLeU3Mn8g6M; 
+Implementation ID: RrkCKxGm72vA9tuDAxKSgDzfvdDhwk1dM0g2ZWmtRKI; 
 
 Signer: vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
 ```
