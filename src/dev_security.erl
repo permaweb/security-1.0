@@ -8,7 +8,6 @@
 -module(dev_security).
 -include_lib("hb/include/hb.hrl").
 -implements(<<"security@1.0">>).
--device_libraries([lib_token]).
 %%% Device API.
 -export([info/0, compute/3, validate/3]).
 %%% Public helpers.
@@ -83,6 +82,12 @@ validate(Base, Req, Opts) ->
 
 %% @doc Validate that an assignment is trusted based on scheduler constraints.
 validate_assignment(Base, Assignment, Opts) ->
+    case arweave_scheduler_assignment(Base, Assignment, Opts) of
+        true -> {ok, Assignment};
+        false -> validate_signed_assignment(Base, Assignment, Opts)
+    end.
+
+validate_signed_assignment(Base, Assignment, Opts) ->
     maybe
         {ok, Signers} ?= verified_signers(Assignment, Opts),
         true ?= validate(<<"scheduler">>, Base, Assignment, Signers, Opts),
@@ -90,6 +95,16 @@ validate_assignment(Base, Assignment, Opts) ->
     else
         {error, Reason} -> {error, Reason}
     end.
+
+arweave_scheduler_assignment(Base, Assignment, Opts) ->
+    hb_ao:get(<<"scheduler-device">>, Base, undefined, Opts) =:= <<"arweave-scheduler@1.0">>
+        andalso hb_ao:get(<<"type">>, Assignment, undefined, Opts) =:= <<"Assignment">>
+        andalso hb_ao:get(<<"path">>, Assignment, undefined, Opts) =:= <<"compute">>
+        andalso hb_ao:get(<<"process">>, Assignment, undefined, Opts) =:= current_process_id(Base, Opts)
+        andalso hb_message:verify(Assignment, #{ <<"commitment-ids">> => <<"all">> }, Opts).
+
+current_process_id(Base, Opts) ->
+    hb_message:id(hb_ao:get(<<"process">>, Base, #{}, Opts), signed, Opts).
 
 %% @doc Validate that a request has proper authority, adding a `from' key to the
 %% assigned message such that downstream callers can refer to a verified sender
@@ -404,10 +419,75 @@ parse_integer(_Value) ->
     {error, <<"Integer value is invalid.">>}.
 
 account_key(Account) when is_binary(Account) ->
-    lib_token:account_key(Account).
+    hb_util:to_lower(hb_ao:normalize_key(Account)).
 
 validate_address(Address, CustomList, Opts) ->
-    lib_token:validate_address(Address, CustomList, Opts).
+    validate_address(Address, CustomList, Opts, account_key(Address)).
+
+validate_address(Address, CustomList, Opts, AccountKey)
+        when is_binary(Address), is_list(CustomList) ->
+    CanonicalCustomKeys = [account_key(Key) || Key <- CustomList, is_binary(Key)],
+    case byte_size(Address) of
+        0 -> {error, <<"Address cannot be empty.">>};
+        N when N > 128 -> {error, <<"Address is too long.">>};
+        _ ->
+            TrieReservedKeys = trie_reserved_keys(Opts),
+            maybe
+                true ?= (AccountKey =/= <<"path">>)
+                    orelse {error, <<"Address uses the reserved path key.">>},
+                true ?= (not is_device_key(AccountKey, Opts))
+                    orelse {error, <<"Address uses a reserved device key.">>},
+                true ?= (not is_reserved_trie_key(Address, TrieReservedKeys))
+                    orelse {error, <<"Address uses a reserved trie internal key.">>},
+                true ?= (not is_reserved_trie_key(AccountKey, TrieReservedKeys))
+                    orelse {error, <<"Address uses a reserved trie internal key.">>},
+                true ?= (not is_reserved_custom_key(Address, CustomList))
+                    orelse {error, <<"Address is a reserved custom key.">>},
+                true ?= (not is_reserved_custom_key(AccountKey, CanonicalCustomKeys))
+                    orelse {error, <<"Address is a reserved custom key.">>},
+                true ?= valid_address_chars(Address)
+                    orelse {error, <<"Address contains unsupported characters.">>}
+            end
+    end;
+validate_address(_, _, _, _) ->
+    {error, <<"Address must be a binary.">>}.
+
+is_device_key(Key, Opts) ->
+    lists:any(
+        fun(Device) ->
+            case hb_device:message_to_fun(
+                #{<<"device">> => Device}, Key, Opts
+            ) of
+                {ok, _, _} -> true;
+                {add_key, _, _} -> false
+            end
+        end,
+        [<<"message@1.0">>, <<"trie@1.0">>]
+    ).
+
+trie_reserved_keys(Opts) ->
+    {ok, Trie} = hb_device_load:reference(<<"trie@1.0">>, Opts),
+    maps:get(reserved, Trie:info(), []).
+
+is_reserved_trie_key(Key, ReservedKeys) ->
+    lists:member(Key, ReservedKeys).
+
+is_reserved_custom_key(Key, List) when is_binary(Key), is_list(List) ->
+    lists:member(Key, List);
+is_reserved_custom_key(_, _) ->
+    false.
+
+valid_address_chars(<<>>) ->
+    true;
+valid_address_chars(<<Char, Rest/binary>>) when
+        Char >= $A, Char =< $Z;
+        Char >= $a, Char =< $z;
+        Char >= $0, Char =< $9;
+        Char =:= $_;
+        Char =:= $- ->
+    valid_address_chars(Rest);
+valid_address_chars(_) ->
+    false.
 
 %% @doc Validate that the request satisfies the given constraints.
 %% Returns true if:
