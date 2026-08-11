@@ -366,8 +366,8 @@ candidate_balance(Candidate, Base, Opts) ->
         not_found ->
             {error, <<"Balances not configured.">>};
         Balances ->
-            Account = account_key(Candidate),
-            case hb_ao:resolve(Balances, Account, Opts) of
+            ID = id_key(Candidate),
+            case hb_ao:resolve(Balances, ID, Opts) of
                 {ok, Balance} when is_integer(Balance), Balance >= 0 ->
                     {ok, Balance};
                 {ok, Balance} when is_integer(Balance) ->
@@ -418,32 +418,32 @@ parse_integer(Value) when is_binary(Value) ->
 parse_integer(_Value) ->
     {error, <<"Integer value is invalid.">>}.
 
-account_key(Account) when is_binary(Account) ->
-    hb_util:to_lower(hb_ao:normalize_key(Account)).
+id_key(ID) when is_binary(ID) ->
+    hb_util:to_lower(hb_ao:normalize_key(ID)).
 
 validate_address(Address, CustomList, Opts) ->
-    validate_address(Address, CustomList, Opts, account_key(Address)).
+    validate_address(Address, CustomList, Opts, id_key(Address)).
 
-validate_address(Address, CustomList, Opts, AccountKey)
+validate_address(Address, CustomList, Opts, IDKey)
         when is_binary(Address), is_list(CustomList) ->
-    CanonicalCustomKeys = [account_key(Key) || Key <- CustomList, is_binary(Key)],
+    CanonicalCustomKeys = [id_key(Key) || Key <- CustomList, is_binary(Key)],
     case byte_size(Address) of
         0 -> {error, <<"Address cannot be empty.">>};
         N when N > 128 -> {error, <<"Address is too long.">>};
         _ ->
             TrieReservedKeys = trie_reserved_keys(Opts),
             maybe
-                true ?= (AccountKey =/= <<"path">>)
+                true ?= (IDKey =/= <<"path">>)
                     orelse {error, <<"Address uses the reserved path key.">>},
-                true ?= (not is_device_key(AccountKey, Opts))
+                true ?= (not is_device_key(IDKey, Opts))
                     orelse {error, <<"Address uses a reserved device key.">>},
                 true ?= (not is_reserved_trie_key(Address, TrieReservedKeys))
                     orelse {error, <<"Address uses a reserved trie internal key.">>},
-                true ?= (not is_reserved_trie_key(AccountKey, TrieReservedKeys))
+                true ?= (not is_reserved_trie_key(IDKey, TrieReservedKeys))
                     orelse {error, <<"Address uses a reserved trie internal key.">>},
                 true ?= (not is_reserved_custom_key(Address, CustomList))
                     orelse {error, <<"Address is a reserved custom key.">>},
-                true ?= (not is_reserved_custom_key(AccountKey, CanonicalCustomKeys))
+                true ?= (not is_reserved_custom_key(IDKey, CanonicalCustomKeys))
                     orelse {error, <<"Address is a reserved custom key.">>},
                 true ?= valid_address_chars(Address)
                     orelse {error, <<"Address contains unsupported characters.">>}

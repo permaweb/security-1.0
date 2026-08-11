@@ -42,16 +42,16 @@ token_policy(Balances, TotalSupply, Extra, Opts) ->
 
 canonical_balances(Balances) ->
     maps:fold(
-        fun(Account, Amount, Acc) ->
-            Key = account_key(Account),
+        fun(ID, Amount, Acc) ->
+            Key = id_key(ID),
             Acc#{ Key => maps:get(Key, Acc, 0) + Amount }
         end,
         #{},
         Balances
     ).
 
-account_key(Account) ->
-    hb_util:to_lower(Account).
+id_key(ID) ->
+    hb_util:to_lower(ID).
 
 signer() ->
     Wallet = ar_wallet:new(),
@@ -515,7 +515,7 @@ set_authority_supply_threshold_bps_allows_half_owner_vector_test() ->
         )
     ).
 
-set_authority_supply_owner_uses_canonical_account_vector_test() ->
+set_authority_supply_owner_uses_canonical_id_vector_test() ->
     Opts = opts(),
     ?assertEqual(
         {ok, true},
