@@ -2,14 +2,52 @@
 -module(hb_security_test_vectors).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("hb/include/hb.hrl").
+-export([info/0, balance/3]).
 
+%% @doc Configure the packaged security device and token Balance test endpoint.
 opts() ->
     hb:init(),
-    #{
+    BaseOpts = #{
         <<"load-remote-devices">> => false,
         <<"priv-wallet">> => ar_wallet:new(),
         <<"store">> => [hb_test_utils:test_store()]
+    },
+    DeviceNames =
+        [
+            <<"security@1.0">>,
+            <<"trie@1.0">>,
+            <<"message@1.0">>,
+            <<"structured@1.0">>,
+            <<"httpsig@1.0">>
+        ],
+    Bootstrap =
+        maps:from_list(
+            [
+                begin
+                    {ok, Module} = hb_device_load:reference(Name, BaseOpts),
+                    {Name, Module}
+                end
+            ||
+                Name <- DeviceNames
+            ]
+        ),
+    BaseOpts#{
+        <<"forge-bootstrap">> =>
+            Bootstrap#{ <<"token@1.0">> => ?MODULE }
     }.
+
+%% @doc Test-only implementation of the token Balance contract.
+info() -> #{ exports => [<<"balance">>] }.
+
+%% @doc Resolve a balance with the deployed token's account-key semantics.
+balance(Base, Req, Opts) ->
+    ID = hb_ao:get(<<"balance">>, Req, Opts),
+    Key =
+        case hb_ao:get(<<"swap-device">>, Base, not_found, Opts) of
+            not_found -> id_key(ID);
+            _ -> ID
+        end,
+    {ok, hb_ao:get([<<"balances">>, Key], Base, 0, Opts)}.
 
 base(Policy) ->
     Policy#{ <<"device">> => <<"security@1.0">> }.
@@ -29,10 +67,15 @@ validate(Key, Policy, From, Opts) ->
 token_policy(Balances, TotalSupply, Opts) ->
     token_policy(Balances, TotalSupply, #{}, Opts).
 token_policy(Balances, TotalSupply, Extra, Opts) ->
+    StoredBalances =
+        case maps:get(<<"swap-device">>, Extra, not_found) of
+            not_found -> canonical_balances(Balances);
+            _ -> Balances
+        end,
     {ok, BalanceTrie} =
         hb_ao:resolve(
             #{ <<"device">> => <<"trie@1.0">> },
-            (canonical_balances(Balances))#{ <<"path">> => <<"set">> },
+            StoredBalances#{ <<"path">> => <<"set">> },
             Opts
         ),
     Extra#{
@@ -270,7 +313,7 @@ delegated_mint_action_rejected_vector_test() ->
         )
     ).
 
-delegated_action_policy_requires_list_vector_test() ->
+delegated_action_policy_structured_fields_vector_test() ->
     Opts = opts(),
     {Scheduler, SchedulerWallet} = signer(),
     {DelegatedSender, _DelegatedWallet} = signer(),
@@ -293,10 +336,18 @@ delegated_action_policy_requires_list_vector_test() ->
         {skip, <<"Delegated action not allowed.">>},
         hb_ao:resolve(base(Policy), Assignment, Opts)
     ),
+    ?assertMatch(
+        {ok, _},
+        hb_ao:resolve(
+            base(Policy#{ <<"authority-actions">> => <<"Transfer">> }),
+            Assignment,
+            Opts
+        )
+    ),
     ?assertEqual(
         {skip, <<"Delegated action not allowed.">>},
         hb_ao:resolve(
-            base(Policy#{ <<"authority-actions">> => <<"Transfer">> }),
+            base(Policy#{ <<"authority-actions">> => <<"@">> }),
             Assignment,
             Opts
         )
@@ -523,6 +574,30 @@ set_authority_supply_owner_uses_canonical_id_vector_test() ->
             <<"set-authority">>,
             token_policy(#{ <<"alice">> => 10 }, 10, Opts),
             <<"ALICE">>,
+            Opts
+        )
+    ).
+
+set_authority_supply_owner_preserves_swap_id_vector_test() ->
+    Opts = opts(),
+    Owner = <<"Tb9KgNJ6lg0K9sdagS-mo7w28Nt9_K-9ITy_It7FNKU">>,
+    Policy =
+        token_policy(
+            #{ Owner => 1 },
+            1,
+            #{ <<"swap-device">> => <<"arweave-swap@1.0">> },
+            Opts
+        ),
+    ?assertEqual(
+        {ok, true},
+        validate(<<"set-authority">>, Policy, Owner, Opts)
+    ),
+    ?assertEqual(
+        {error, <<"Supply-threshold owner requirement not satisfied.">>},
+        validate(
+            <<"set-authority">>,
+            Policy,
+            hb_util:to_lower(Owner),
             Opts
         )
     ).

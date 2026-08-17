@@ -151,7 +151,7 @@ validate_authority(Base, Assignment, Opts) ->
 validate_authority_action(Base, Msg, Opts) ->
     try
         Action = hb_ao:get(<<"action">>, Msg, not_found, Opts),
-        Allowed = hb_ao:get(<<"authority-actions">>, Base, [], Opts),
+        Allowed = authority_actions(Base, Opts),
         Valid =
             is_binary(Action) andalso byte_size(Action) > 0 andalso
                 is_list(Allowed) andalso Allowed =/= [] andalso
@@ -168,6 +168,27 @@ validate_authority_action(Base, Msg, Opts) ->
         end
     catch
         _:_ -> {error, <<"Delegated action not allowed.">>}
+    end.
+
+authority_actions(Base, Opts) ->
+    case hb_ao:get(<<"authority-actions">>, Base, [], Opts) of
+        Allowed when is_list(Allowed) ->
+            Allowed;
+        Encoded when is_binary(Encoded) ->
+            decode_authority_actions(Encoded);
+        _ ->
+            []
+    end.
+
+decode_authority_actions(Encoded) ->
+    try
+        [
+            hb_structured_fields:from_bare_item(Item)
+        ||
+            {item, Item, _Params} <- hb_structured_fields:parse_list(Encoded)
+        ]
+    catch
+        _:_ -> []
     end.
 
 %% @doc If a message purporting to be from a process satisfies the compute
@@ -365,9 +386,14 @@ candidate_balance(Candidate, Base, Opts) ->
     case hb_ao:get(<<"balances">>, Base, not_found, Opts) of
         not_found ->
             {error, <<"Balances not configured.">>};
-        Balances ->
-            ID = id_key(Candidate),
-            case hb_ao:resolve(Balances, ID, Opts) of
+        _Balances ->
+            case hb_ao:raw(
+                <<"token@1.0">>,
+                <<"balance">>,
+                Base,
+                #{ <<"balance">> => Candidate },
+                Opts
+            ) of
                 {ok, Balance} when is_integer(Balance), Balance >= 0 ->
                     {ok, Balance};
                 {ok, Balance} when is_integer(Balance) ->
