@@ -11,31 +11,7 @@
 %%% Device API.
 -export([info/0, compute/3, validate/3]).
 %%% Public helpers.
--export([validate_address/2]).
-
-%% @doc `validate_address/3` built-in reserved keys list. Keep in sync with
-%% token address validation for balance-backed security templates.
--define(AO_RESERVED_ADDRESS_KEYS,
-    [
-        <<"path">>,
-        <<"get">>,
-        <<"set">>,
-        <<"remove">>,
-        <<"verify">>,
-        <<"keys">>,
-        <<"id">>,
-        <<"commit">>,
-        <<"committed">>,
-        <<"committers">>,
-        <<"index">>,
-        <<"info">>,
-        <<"set_path">>,
-        <<"reserved_keys">>,
-        <<"is_reserved_key">>,
-        <<"dedup">>,
-        <<"dedup-subject">>
-    ]
-).
+-export([validate_address/3]).
 
 %% @doc Return the public security device API.
 info() ->
@@ -47,7 +23,8 @@ info() ->
 compute(Base, Req, Opts) ->
     ?event(security_debug, {compute_called, {base, Base}, {req, Req}}, Opts),
     maybe
-        {ok, SecureReq1} ?= validate_assignment(Base, Req, Opts),
+        {ok, HydratedReq} ?= hydrate_assignment_body(Req, Opts),
+        {ok, SecureReq1} ?= validate_assignment(Base, HydratedReq, Opts),
         {ok, _SecureReq2} ?= validate_authority(Base, SecureReq1, Opts)
     else
         {error, Reason} ->
@@ -61,6 +38,24 @@ compute(Base, Req, Opts) ->
             ),
             {skip, Reason}
     end.
+
+%% @doc Restore a cache-linked body's commitment set before verifying the
+%% scheduler's commitment over the Assignment. A raw map update is intentional:
+%% `hb_ao:set' would invalidate the outer commitment we are reconstructing.
+hydrate_assignment_body(Assignment, Opts) when is_map(Assignment) ->
+    case hb_ao:get(<<"body">>, Assignment, not_found, Opts) of
+        Body when is_map(Body) ->
+            case hydrate_subject(Body, Opts) of
+                {ok, HydratedBody} ->
+                    {ok, Assignment#{ <<"body">> => HydratedBody }};
+                {error, _} = Error ->
+                    Error
+            end;
+        _ ->
+            {error, <<"Security subject must be a message.">>}
+    end;
+hydrate_assignment_body(_Assignment, _Opts) ->
+    {error, <<"Security subject must be a message.">>}.
 
 %% @doc Validate a caller-controlled security intent through the device API.
 %% Expected request keys:
@@ -87,33 +82,57 @@ validate(Base, Req, Opts) ->
 
 %% @doc Validate that an assignment is trusted based on scheduler constraints.
 validate_assignment(Base, Assignment, Opts) ->
-    case validate(<<"scheduler">>, Base, Assignment, Opts) of
-        true ->
-            {ok, Assignment};
-        {error, Reason} ->
-            {error, Reason}
+    case arweave_scheduler_assignment(Base, Assignment, Opts) of
+        true -> {ok, Assignment};
+        false -> validate_signed_assignment(Base, Assignment, Opts)
     end.
+
+validate_signed_assignment(Base, Assignment, Opts) ->
+    maybe
+        {ok, Signers} ?= verified_signers(Assignment, Opts),
+        true ?= validate(<<"scheduler">>, Base, Assignment, Signers, Opts),
+        {ok, Assignment}
+    else
+        {error, Reason} -> {error, Reason}
+    end.
+
+arweave_scheduler_assignment(Base, Assignment, Opts) ->
+    hb_ao:get(<<"scheduler-device">>, Base, undefined, Opts) =:= <<"arweave-scheduler@1.0">>
+        andalso hb_ao:get(<<"type">>, Assignment, undefined, Opts) =:= <<"Assignment">>
+        andalso hb_ao:get(<<"path">>, Assignment, undefined, Opts) =:= <<"compute">>
+        andalso hb_ao:get(<<"process">>, Assignment, undefined, Opts) =:= current_process_id(Base, Opts)
+        andalso hb_message:verify(Assignment, #{ <<"commitment-ids">> => <<"all">> }, Opts).
+
+current_process_id(Base, Opts) ->
+    hb_message:id(hb_ao:get(<<"process">>, Base, #{}, Opts), signed, Opts).
 
 %% @doc Validate that a request has proper authority, adding a `from' key to the
 %% assigned message such that downstream callers can refer to a verified sender
 %% (for replies, etc) -- whether an end-user wallet or another process.
 validate_authority(Base, Assignment, Opts) ->
     Msg = hb_ao:get(<<"body">>, Assignment, undefined, Opts),
-    Signers = hb_message:signers(Msg, Opts),
-    case hb_ao:get(<<"from-process">>, Msg, undefined, Opts) of
-        undefined ->
-            {
-                ok,
-                hb_ao:set(
-                    Assignment,
-                    <<"body/from">>,
-                    maybe_single(Signers, Opts),
-                    Opts
-                )
-            };
-        Sender ->
-            case validate(<<"authority">>, Base, Msg, Opts) of
-                true ->
+    maybe
+        {ok, Signers} ?= verified_signers(Msg, Opts),
+        case hb_ao:get(<<"from-process">>, Msg, undefined, Opts) of
+            undefined ->
+                {
+                    ok,
+                    hb_ao:set(
+                        Assignment,
+                        <<"body/from">>,
+                        maybe_single(Signers, Opts),
+                        Opts
+                    )
+                };
+            Sender ->
+                maybe
+                    %% A delegated sender must be one valid identity, never a
+                    %% list interpreted as multiple authorization candidates.
+                    true ?= validate_address(Sender, [], Opts),
+                    true ?= (length(Signers) =:= 1) orelse
+                        {error, <<"Delegated messages require exactly one signer.">>},
+                    true ?= validate(<<"authority">>, Base, Msg, Signers, Opts),
+                    true ?= validate_authority_action(Base, Msg, Opts),
                     {
                         ok,
                         hb_ao:set(
@@ -122,9 +141,54 @@ validate_authority(Base, Assignment, Opts) ->
                             Sender,
                             Opts
                         )
-                    };
-                {error, Reason} -> {error, Reason}
-            end
+                    }
+                end
+        end
+    end.
+
+%% @doc Restrict process-delegated identities to explicitly configured actions.
+%% Wallet-signed messages do not carry `from-process' and do not enter this path.
+validate_authority_action(Base, Msg, Opts) ->
+    try
+        Action = hb_ao:get(<<"action">>, Msg, not_found, Opts),
+        Allowed = authority_actions(Base, Opts),
+        Valid =
+            is_binary(Action) andalso byte_size(Action) > 0 andalso
+                is_list(Allowed) andalso Allowed =/= [] andalso
+                lists:all(
+                    fun(Item) -> is_binary(Item) andalso byte_size(Item) > 0 end,
+                    Allowed
+                ),
+        case Valid andalso lists:member(
+            hb_util:to_lower(Action),
+            [hb_util:to_lower(Item) || Item <- Allowed]
+        ) of
+            true -> true;
+            false -> {error, <<"Delegated action not allowed.">>}
+        end
+    catch
+        _:_ -> {error, <<"Delegated action not allowed.">>}
+    end.
+
+authority_actions(Base, Opts) ->
+    case hb_ao:get(<<"authority-actions">>, Base, [], Opts) of
+        Allowed when is_list(Allowed) ->
+            Allowed;
+        Encoded when is_binary(Encoded) ->
+            decode_authority_actions(Encoded);
+        _ ->
+            []
+    end.
+
+decode_authority_actions(Encoded) ->
+    try
+        [
+            hb_structured_fields:from_bare_item(Item)
+        ||
+            {item, Item, _Params} <- hb_structured_fields:parse_list(Encoded)
+        ]
+    catch
+        _:_ -> []
     end.
 
 %% @doc If a message purporting to be from a process satisfies the compute
@@ -134,6 +198,42 @@ validate(Key, Base, SubjectMsg, Opts) ->
 validate(Key, Base, SubjectMsg, RawFrom, Opts) ->
     Template = security_template(Key, Base, Opts),
     validate_with_template(Template, Key, Base, SubjectMsg, RawFrom, Opts).
+
+%% @doc Return only signer identities whose commitments verify against the
+%% subject. Signer metadata alone is not authentication and an empty signer set
+%% must never satisfy a security policy.
+verified_signers(SubjectMsg, Opts) when is_map(SubjectMsg) ->
+    try
+        Signers = lists:uniq(hb_message:signers(SubjectMsg, Opts)),
+        case Signers of
+            [] ->
+                {error, <<"Security subject has no signers.">>};
+            _ ->
+                case hb_message:verify(SubjectMsg, Signers, Opts) of
+                    true -> {ok, Signers};
+                    false ->
+                        {error, <<"Security subject signature verification failed.">>}
+                end
+        end
+    catch
+        _:_ -> {error, <<"Security subject signature verification failed.">>}
+    end;
+verified_signers(_SubjectMsg, _Opts) ->
+    {error, <<"Security subject must be a message.">>}.
+
+%% @doc Explicit commitment reads are required for aggregate cache links. This
+%% helper is only used for a body bound by an outer Assignment commitment. Do not
+%% expand a body that already carries signers: doing so would allow a later
+%% commitment to change the signer set of an existing Assignment.
+hydrate_subject(SubjectMsg, Opts) ->
+    try
+        case hb_message:signers(SubjectMsg, Opts) of
+            [] -> {ok, hb_cache:read_all_commitments(SubjectMsg, Opts)};
+            _ -> {ok, SubjectMsg}
+        end
+    catch
+        _:_ -> {error, <<"Security subject signature verification failed.">>}
+    end.
 
 validate_with_template(<<"static-signer-set">>, Key, Base, SubjectMsg, RawFrom, Opts) ->
     maybe
@@ -286,9 +386,14 @@ candidate_balance(Candidate, Base, Opts) ->
     case hb_ao:get(<<"balances">>, Base, not_found, Opts) of
         not_found ->
             {error, <<"Balances not configured.">>};
-        Balances ->
-            Account = account_key(Candidate),
-            case hb_ao:resolve(Balances, Account, Opts) of
+        _Balances ->
+            case hb_ao:raw(
+                <<"token@1.0">>,
+                <<"balance">>,
+                Base,
+                #{ <<"balance">> => Candidate },
+                Opts
+            ) of
                 {ok, Balance} when is_integer(Balance), Balance >= 0 ->
                     {ok, Balance};
                 {ok, Balance} when is_integer(Balance) ->
@@ -304,14 +409,15 @@ candidate_balance(Candidate, Base, Opts) ->
 
 total_supply(Base, Opts) ->
     case hb_ao:get(<<"total-supply">>, Base, not_found, Opts) of
-        TotalSupply when is_integer(TotalSupply), TotalSupply > 0 ->
-            {ok, TotalSupply};
-        TotalSupply when is_integer(TotalSupply) ->
-            {error, <<"Total supply must be positive.">>};
         not_found ->
             {error, <<"Total supply not configured.">>};
-        _ ->
-            {error, <<"Total supply must be an integer.">>}
+        Raw ->
+            case parse_integer(Raw) of
+                TotalSupply when TotalSupply > 0 -> {ok, TotalSupply};
+                TotalSupply when is_integer(TotalSupply) ->
+                    {error, <<"Total supply must be positive.">>};
+                Error -> Error
+            end
     end.
 
 threshold_bps(Key, Base, Opts) ->
@@ -339,54 +445,75 @@ parse_integer(Value) when is_binary(Value) ->
 parse_integer(_Value) ->
     {error, <<"Integer value is invalid.">>}.
 
-account_key(Account) when is_binary(Account) ->
-    hb_util:to_lower(Account).
+id_key(ID) when is_binary(ID) ->
+    hb_util:to_lower(hb_ao:normalize_key(ID)).
 
-%% @doc Validate address format for security. The validation allows binary
-%% addresses up to 128 bytes and prevents invalid addresses such as trie
-%% reserved keys.
-validate_address(Address, CustomList) ->
-    validate_address(Address, CustomList, #{}).
+validate_address(Address, CustomList, Opts) ->
+    validate_address(Address, CustomList, Opts, id_key(Address)).
 
-validate_address(Address, CustomList, Opts) when is_binary(Address), is_list(CustomList) ->
-    ReservedKeys = ?AO_RESERVED_ADDRESS_KEYS ++ CustomList,
-    AccountKey = account_key(Address),
-    CanonicalReservedKeys = [account_key(Key) || Key <- ReservedKeys, is_binary(Key)],
+validate_address(Address, CustomList, Opts, IDKey)
+        when is_binary(Address), is_list(CustomList) ->
+    CanonicalCustomKeys = [id_key(Key) || Key <- CustomList, is_binary(Key)],
     case byte_size(Address) of
         0 -> {error, <<"Address cannot be empty.">>};
         N when N > 128 -> {error, <<"Address is too long.">>};
         _ ->
             TrieReservedKeys = trie_reserved_keys(Opts),
             maybe
+                true ?= (IDKey =/= <<"path">>)
+                    orelse {error, <<"Address uses the reserved path key.">>},
+                true ?= (not is_device_key(IDKey, Opts))
+                    orelse {error, <<"Address uses a reserved device key.">>},
                 true ?= (not is_reserved_trie_key(Address, TrieReservedKeys))
                     orelse {error, <<"Address uses a reserved trie internal key.">>},
-                true ?= (not is_reserved_trie_key(AccountKey, TrieReservedKeys))
+                true ?= (not is_reserved_trie_key(IDKey, TrieReservedKeys))
                     orelse {error, <<"Address uses a reserved trie internal key.">>},
-                true ?= (not is_reserved_custom_key(Address, ReservedKeys))
-                    orelse {error, <<"Address is a reserved ao/custom key">>},
-                true ?= (not is_reserved_custom_key(AccountKey, CanonicalReservedKeys))
-                    orelse {error, <<"Address is a reserved ao/custom key">>},
-                % Check for path separators (security: prevent path traversal) and whitespaces.
-                case binary:match(Address, [<<"/">>, <<"\\">>, <<" ">>, <<"\n">>, <<"\r">>, <<"\t">>]) of
-                    nomatch -> true;
-                    _ -> {error, <<"Address cannot contain path separators or whitespaces">>}
-                end
+                true ?= (not is_reserved_custom_key(Address, CustomList))
+                    orelse {error, <<"Address is a reserved custom key.">>},
+                true ?= (not is_reserved_custom_key(IDKey, CanonicalCustomKeys))
+                    orelse {error, <<"Address is a reserved custom key.">>},
+                true ?= valid_address_chars(Address)
+                    orelse {error, <<"Address contains unsupported characters.">>}
             end
     end;
-validate_address(_, _, _) ->
+validate_address(_, _, _, _) ->
     {error, <<"Address must be a binary.">>}.
 
-is_reserved_trie_key(Key, ReservedKeys) ->
-    lists:member(Key, ReservedKeys).
+is_device_key(Key, Opts) ->
+    lists:any(
+        fun(Device) ->
+            case hb_device:message_to_fun(
+                #{<<"device">> => Device}, Key, Opts
+            ) of
+                {ok, _, _} -> true;
+                {add_key, _, _} -> false
+            end
+        end,
+        [<<"message@1.0">>, <<"trie@1.0">>]
+    ).
 
 trie_reserved_keys(Opts) ->
     {ok, Trie} = hb_device_load:reference(<<"trie@1.0">>, Opts),
     maps:get(reserved, Trie:info(), []).
 
-%% @doc Check if the given Key exists in the passed List.
+is_reserved_trie_key(Key, ReservedKeys) ->
+    lists:member(Key, ReservedKeys).
+
 is_reserved_custom_key(Key, List) when is_binary(Key), is_list(List) ->
     lists:member(Key, List);
 is_reserved_custom_key(_, _) ->
+    false.
+
+valid_address_chars(<<>>) ->
+    true;
+valid_address_chars(<<Char, Rest/binary>>) when
+        Char >= $A, Char =< $Z;
+        Char >= $a, Char =< $z;
+        Char >= $0, Char =< $9;
+        Char =:= $_;
+        Char =:= $- ->
+    valid_address_chars(Rest);
+valid_address_chars(_) ->
     false.
 
 %% @doc Validate that the request satisfies the given constraints.

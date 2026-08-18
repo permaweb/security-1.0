@@ -26,6 +26,12 @@ current templates:
 
 mixing static `set-authority` keys with `supply-threshold-owner` is rejected
 
+## delegated process actions
+
+Messages with `from-process` must satisfy both the `authority` signer policy and the `authority-actions` action allowlist. The allowlist must be a non-empty list of non-empty binaries and compares actions case-insensitively. A missing or malformed policy fails closed.
+
+This policy only applies to process-delegated identity. Direct wallet messages derive `from` from their verified signers and do not require `authority-actions`.
+
 ## build
 
 ```sh
@@ -35,20 +41,20 @@ rebar3 compile
 ## package
 
 ```sh
-rebar3 device package
-rebar3 device verify
+rebar3 device package --device-src=src,_build/default/lib/hb/src/preloaded/token
+rebar3 device verify --device-src=src,_build/default/lib/hb/src/preloaded/token
 ```
 
 ## published package
 
 ```bash
-device publish: security@1.0 
+Published device: security@1.0; 
 
-spec=qtC0Ae3Yt78mN8jqWG2dH14grcUK9CKhAtd3dsJ-ft0 
+Specification ID: aBwRgV-ReeqDAehZe2QcLrUSX1kROpX_0t_qHCjQAA4;
 
-impl=cfKDo4KvBzje-teLrwcLn98LY7DeecFdX1r7HgEcGtI 
+Implementation ID: 8Yex09pPfsGgzi87LswaIZg6U5Z8tjUs6wMQhCyVWGU;
 
-signer=vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
+Signer: vZY2XY1RD9HIfWi8ift-1_DnHLDadZMWrufSh-_rKF0
 ```
 
 ## test
@@ -67,7 +73,7 @@ rebar3 device local
 ## publish
 
 ```sh
-rebar3 device publish --key wallet.json
+rebar3 device publish --device-src=src,_build/default/lib/hb/src/preloaded/token --key wallet.json
 ```
 
 ## license

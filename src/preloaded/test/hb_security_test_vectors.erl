@@ -2,14 +2,52 @@
 -module(hb_security_test_vectors).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("hb/include/hb.hrl").
+-export([info/0, balance/3]).
 
+%% @doc Configure the packaged security device and token Balance test endpoint.
 opts() ->
     hb:init(),
-    #{
+    BaseOpts = #{
         <<"load-remote-devices">> => false,
         <<"priv-wallet">> => ar_wallet:new(),
         <<"store">> => [hb_test_utils:test_store()]
+    },
+    DeviceNames =
+        [
+            <<"security@1.0">>,
+            <<"trie@1.0">>,
+            <<"message@1.0">>,
+            <<"structured@1.0">>,
+            <<"httpsig@1.0">>
+        ],
+    Bootstrap =
+        maps:from_list(
+            [
+                begin
+                    {ok, Module} = hb_device_load:reference(Name, BaseOpts),
+                    {Name, Module}
+                end
+            ||
+                Name <- DeviceNames
+            ]
+        ),
+    BaseOpts#{
+        <<"forge-bootstrap">> =>
+            Bootstrap#{ <<"token@1.0">> => ?MODULE }
     }.
+
+%% @doc Test-only implementation of the token Balance contract.
+info() -> #{ exports => [<<"balance">>] }.
+
+%% @doc Resolve a balance with the deployed token's account-key semantics.
+balance(Base, Req, Opts) ->
+    ID = hb_ao:get(<<"balance">>, Req, Opts),
+    Key =
+        case hb_ao:get(<<"swap-device">>, Base, not_found, Opts) of
+            not_found -> id_key(ID);
+            _ -> ID
+        end,
+    {ok, hb_ao:get([<<"balances">>, Key], Base, 0, Opts)}.
 
 base(Policy) ->
     Policy#{ <<"device">> => <<"security@1.0">> }.
@@ -29,10 +67,15 @@ validate(Key, Policy, From, Opts) ->
 token_policy(Balances, TotalSupply, Opts) ->
     token_policy(Balances, TotalSupply, #{}, Opts).
 token_policy(Balances, TotalSupply, Extra, Opts) ->
+    StoredBalances =
+        case maps:get(<<"swap-device">>, Extra, not_found) of
+            not_found -> canonical_balances(Balances);
+            _ -> Balances
+        end,
     {ok, BalanceTrie} =
         hb_ao:resolve(
             #{ <<"device">> => <<"trie@1.0">> },
-            (canonical_balances(Balances))#{ <<"path">> => <<"set">> },
+            StoredBalances#{ <<"path">> => <<"set">> },
             Opts
         ),
     Extra#{
@@ -42,16 +85,51 @@ token_policy(Balances, TotalSupply, Extra, Opts) ->
 
 canonical_balances(Balances) ->
     maps:fold(
-        fun(Account, Amount, Acc) ->
-            Key = account_key(Account),
+        fun(ID, Amount, Acc) ->
+            Key = id_key(ID),
             Acc#{ Key => maps:get(Key, Acc, 0) + Amount }
         end,
         #{},
         Balances
     ).
 
-account_key(Account) ->
-    hb_util:to_lower(Account).
+id_key(ID) ->
+    hb_util:to_lower(ID).
+
+signer() ->
+    Wallet = ar_wallet:new(),
+    {hb_util:human_id(ar_wallet:to_address(Wallet)), Wallet}.
+
+sign_subject(Body, RawWallets, Opts) ->
+    Wallets = case RawWallets of
+        List when is_list(List) -> List;
+        Wallet -> [Wallet]
+    end,
+    lists:foldl(
+        fun(Wallet, Msg) ->
+            hb_message:commit(Msg, Opts#{ <<"priv-wallet">> => Wallet })
+        end,
+        Body,
+        Wallets
+    ).
+
+cache_roundtrip(Msg, Opts) ->
+    {ok, _} = hb_cache:write(Msg, Opts),
+    {ok, Cached} = hb_cache:read(hb_message:id(Msg, all, Opts), Opts),
+    hb_cache:ensure_all_loaded(Cached, Opts).
+
+sign_assignment(Body, BodyWallets, SchedulerWallet, Opts) ->
+    SignedBody = sign_subject(Body, BodyWallets, Opts),
+    sign_subject(
+        #{
+            <<"path">> => <<"compute">>,
+            <<"type">> => <<"Assignment">>,
+            <<"slot">> => 0,
+            <<"body">> => SignedBody
+        },
+        SchedulerWallet,
+        Opts
+    ).
 
 duplicate_authority_match_rejected_vector_test() ->
     Opts = opts(),
@@ -95,6 +173,261 @@ validate_route_uses_explicit_from_vector_test() ->
             <<"alice">>,
             Opts
         )
+    ).
+
+compute_hydrates_two_of_three_assignment_body_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {AdminA, AdminAWallet} = signer(),
+    {AdminB, AdminBWallet} = signer(),
+    {AdminC, _AdminCWallet} = signer(),
+    Body =
+        sign_subject(
+            #{ <<"action">> => <<"Set">> },
+            [AdminAWallet, AdminBWallet],
+            Opts
+        ),
+    Assignment =
+        sign_subject(
+            #{
+                <<"path">> => <<"compute">>,
+                <<"type">> => <<"Assignment">>,
+                <<"slot">> => 0,
+                <<"body">> => Body
+            },
+            SchedulerWallet,
+            Opts
+        ),
+    CachedAssignment = cache_roundtrip(Assignment, Opts),
+    CachedBody = hb_ao:get(<<"body">>, CachedAssignment, Opts),
+    ?assertEqual([], hb_message:signers(CachedBody, Opts)),
+    ?assertNot(hb_message:verify(CachedAssignment, signers, Opts)),
+    {ok, SecuredAssignment} =
+        hb_ao:resolve(
+            base(#{ <<"scheduler">> => Scheduler }),
+            CachedAssignment,
+            Opts
+        ),
+    From = hb_ao:get(<<"body/from">>, SecuredAssignment, Opts),
+    ?assertEqual(lists:sort([AdminA, AdminB]), lists:sort(From)),
+    ?assertEqual(
+        {ok, true},
+        validate(
+            <<"set-authority">>,
+            #{
+                <<"set-authority">> => [AdminA, AdminB, AdminC],
+                <<"set-authority-match">> => 2
+            },
+            From,
+            Opts
+        )
+    ).
+
+delegated_transfer_action_allowed_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<"tRaNsFeR">>,
+                <<"from-process">> => DelegatedSender
+            },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    {ok, SecuredAssignment} =
+        hb_ao:resolve(
+            base(
+                #{
+                    <<"scheduler">> => Scheduler,
+                    <<"authority">> => Scheduler,
+                    <<"authority-actions">> => [<<"Transfer">>]
+                }
+            ),
+            Assignment,
+            Opts
+        ),
+    ?assertEqual(
+        DelegatedSender,
+        hb_ao:get(<<"body/from">>, SecuredAssignment, Opts)
+    ).
+
+delegated_extra_signer_rejected_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {_External, ExternalWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<"Transfer">>,
+                <<"from-process">> => DelegatedSender
+            },
+            [SchedulerWallet, ExternalWallet],
+            SchedulerWallet,
+            Opts
+        ),
+    Base =
+        base(
+            #{
+                <<"scheduler">> => Scheduler,
+                <<"authority">> => Scheduler,
+                <<"authority-actions">> => [<<"Transfer">>]
+            }
+        ),
+    Rejected = {skip, <<"Delegated messages require exactly one signer.">>},
+    ?assertEqual(Rejected, hb_ao:resolve(Base, Assignment, Opts)),
+    ?assertEqual(
+        Rejected,
+        hb_ao:resolve(Base, cache_roundtrip(Assignment, Opts), Opts)
+    ).
+
+delegated_mint_action_rejected_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<"Mint">>,
+                <<"from-process">> => DelegatedSender
+            },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(
+            base(
+                #{
+                    <<"scheduler">> => Scheduler,
+                    <<"authority">> => Scheduler,
+                    <<"authority-actions">> => [<<"Transfer">>]
+                }
+            ),
+            Assignment,
+            Opts
+        )
+    ).
+
+delegated_action_policy_structured_fields_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<"Transfer">>,
+                <<"from-process">> => DelegatedSender
+            },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    Policy =
+        #{
+            <<"scheduler">> => Scheduler,
+            <<"authority">> => Scheduler
+        },
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(base(Policy), Assignment, Opts)
+    ),
+    ?assertMatch(
+        {ok, _},
+        hb_ao:resolve(
+            base(Policy#{ <<"authority-actions">> => <<"Transfer">> }),
+            Assignment,
+            Opts
+        )
+    ),
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(
+            base(Policy#{ <<"authority-actions">> => <<"@">> }),
+            Assignment,
+            Opts
+        )
+    ).
+
+delegated_message_requires_action_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{ <<"from-process">> => DelegatedSender },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(
+            base(
+                #{
+                    <<"scheduler">> => Scheduler,
+                    <<"authority">> => Scheduler,
+                    <<"authority-actions">> => [<<"Transfer">>]
+                }
+            ),
+            Assignment,
+            Opts
+        )
+    ).
+
+delegated_invalid_action_rejected_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {DelegatedSender, _DelegatedWallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{
+                <<"action">> => <<255>>,
+                <<"from-process">> => DelegatedSender
+            },
+            SchedulerWallet,
+            SchedulerWallet,
+            Opts
+        ),
+    ?assertEqual(
+        {skip, <<"Delegated action not allowed.">>},
+        hb_ao:resolve(
+            base(
+                #{
+                    <<"scheduler">> => Scheduler,
+                    <<"authority">> => Scheduler,
+                    <<"authority-actions">> => [<<"Transfer">>]
+                }
+            ),
+            Assignment,
+            Opts
+        )
+    ).
+
+wallet_action_does_not_require_delegated_policy_vector_test() ->
+    Opts = opts(),
+    {Scheduler, SchedulerWallet} = signer(),
+    {WalletAddress, Wallet} = signer(),
+    Assignment =
+        sign_assignment(
+            #{ <<"action">> => <<"Mint">> },
+            Wallet,
+            SchedulerWallet,
+            Opts
+        ),
+    {ok, SecuredAssignment} =
+        hb_ao:resolve(
+            base(#{ <<"scheduler">> => Scheduler }),
+            Assignment,
+            Opts
+        ),
+    ?assertEqual(
+        WalletAddress,
+        hb_ao:get(<<"body/from">>, SecuredAssignment, Opts)
     ).
 
 raw_set_authority_static_policy_allows_exact_from_vector_test() ->
@@ -233,7 +566,7 @@ set_authority_supply_threshold_bps_allows_half_owner_vector_test() ->
         )
     ).
 
-set_authority_supply_owner_uses_canonical_account_vector_test() ->
+set_authority_supply_owner_uses_canonical_id_vector_test() ->
     Opts = opts(),
     ?assertEqual(
         {ok, true},
@@ -241,6 +574,42 @@ set_authority_supply_owner_uses_canonical_account_vector_test() ->
             <<"set-authority">>,
             token_policy(#{ <<"alice">> => 10 }, 10, Opts),
             <<"ALICE">>,
+            Opts
+        )
+    ).
+
+set_authority_supply_owner_preserves_swap_id_vector_test() ->
+    Opts = opts(),
+    Owner = <<"Tb9KgNJ6lg0K9sdagS-mo7w28Nt9_K-9ITy_It7FNKU">>,
+    Policy =
+        token_policy(
+            #{ Owner => 1 },
+            1,
+            #{ <<"swap-device">> => <<"arweave-swap@1.0">> },
+            Opts
+        ),
+    ?assertEqual(
+        {ok, true},
+        validate(<<"set-authority">>, Policy, Owner, Opts)
+    ),
+    ?assertEqual(
+        {error, <<"Supply-threshold owner requirement not satisfied.">>},
+        validate(
+            <<"set-authority">>,
+            Policy,
+            hb_util:to_lower(Owner),
+            Opts
+        )
+    ).
+
+set_authority_supply_owner_accepts_wire_supply_vector_test() ->
+    Opts = opts(),
+    ?assertEqual(
+        {ok, true},
+        validate(
+            <<"set-authority">>,
+            token_policy(#{ <<"alice">> => 1 }, <<"1">>, Opts),
+            <<"alice">>,
             Opts
         )
     ).
@@ -332,7 +701,7 @@ set_authority_match_only_static_policy_rejected_vector_test() ->
 set_authority_supply_owner_rejects_path_candidate_vector_test() ->
     Opts = opts(),
     ?assertEqual(
-        {error, <<"Address cannot contain path separators or whitespaces">>},
+        {error, <<"Address contains unsupported characters.">>},
         validate(
             <<"set-authority">>,
             token_policy(#{ <<"alice">> => 10 }, 10, Opts),
