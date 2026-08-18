@@ -409,14 +409,15 @@ candidate_balance(Candidate, Base, Opts) ->
 
 total_supply(Base, Opts) ->
     case hb_ao:get(<<"total-supply">>, Base, not_found, Opts) of
-        TotalSupply when is_integer(TotalSupply), TotalSupply > 0 ->
-            {ok, TotalSupply};
-        TotalSupply when is_integer(TotalSupply) ->
-            {error, <<"Total supply must be positive.">>};
         not_found ->
             {error, <<"Total supply not configured.">>};
-        _ ->
-            {error, <<"Total supply must be an integer.">>}
+        Raw ->
+            case parse_integer(Raw) of
+                TotalSupply when TotalSupply > 0 -> {ok, TotalSupply};
+                TotalSupply when is_integer(TotalSupply) ->
+                    {error, <<"Total supply must be positive.">>};
+                Error -> Error
+            end
     end.
 
 threshold_bps(Key, Base, Opts) ->

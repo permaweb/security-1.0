@@ -602,6 +602,18 @@ set_authority_supply_owner_preserves_swap_id_vector_test() ->
         )
     ).
 
+set_authority_supply_owner_accepts_wire_supply_vector_test() ->
+    Opts = opts(),
+    ?assertEqual(
+        {ok, true},
+        validate(
+            <<"set-authority">>,
+            token_policy(#{ <<"alice">> => 1 }, <<"1">>, Opts),
+            <<"alice">>,
+            Opts
+        )
+    ).
+
 set_authority_static_policy_takes_precedence_vector_test() ->
     Opts = opts(),
     Admin = <<"admin">>,
